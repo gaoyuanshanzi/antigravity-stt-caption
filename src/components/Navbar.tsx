@@ -28,7 +28,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                 AI 실시간 음성인식 & 자막 번역기
               </h1>
               <span className="hidden sm:inline-flex px-2 py-0.5 text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-200 rounded-md">
-                Gemini 1.5 Flash
+                Gemini 3.6 Flash
               </span>
             </div>
             <p className="text-xs text-slate-500 hidden md:block">

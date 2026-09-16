@@ -117,12 +117,6 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onLoginSuccess }) => {
               <span>로그인 및 시스템 시작</span>
             </button>
           </div>
-
-          <div className="text-center pt-1">
-            <div className="inline-flex items-center gap-1.5 px-3 py-1 bg-slate-100 rounded-full text-[11px] text-slate-500 font-medium">
-              <span>기본 계정: admin / 123jesus</span>
-            </div>
-          </div>
         </form>
       </div>
     </div>

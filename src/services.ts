@@ -42,8 +42,21 @@ export async function translateWithGemini({
     },
   }
 
-  // Primary model and fallbacks if API version changes
-  const models = ['gemini-1.5-flash', 'gemini-2.0-flash', 'gemini-2.5-flash']
+  // Priority list of Gemini models, with latest gemini-3.6-flash first
+  const candidateModels = [
+    'gemini-3.6-flash',
+    'gemini-2.5-flash',
+    'gemini-2.0-flash',
+    'gemini-1.5-flash',
+    'gemini-1.5-flash-latest',
+    'gemini-1.5-pro',
+  ]
+
+  // If we already know a working model, prioritize it
+  const models = cachedModel
+    ? [cachedModel, ...candidateModels.filter((m) => m !== cachedModel)]
+    : candidateModels
+
   let lastError: Error | null = null
 
   for (const model of models) {
@@ -69,12 +82,19 @@ export async function translateWithGemini({
           throw new Error('Gemini API 접근 권한이 없습니다 (401/403). API Key를 확인해주세요.')
         } else if (response.status === 429) {
           throw new Error('Gemini API 요청 한도를 초과했습니다 (429). 잠시 후 다시 시도됩니다.')
-        } else if (response.status === 404) {
-          // Try next model if 404
+        } else if (
+          response.status === 404 ||
+          errorMsg.includes('no longer available') ||
+          errorMsg.includes('not found') ||
+          errorMsg.includes('deprecated') ||
+          errorMsg.includes('update your code')
+        ) {
+          // Model unavailable or deprecated, continue to next candidate
           lastError = new Error(errorMsg)
           continue
         } else {
-          throw new Error(`번역 오류: ${errorMsg}`)
+          lastError = new Error(errorMsg)
+          continue
         }
       }
 
@@ -85,6 +105,9 @@ export async function translateWithGemini({
       if (!translatedText) {
         throw new Error('번역 결과를 반환받지 못했습니다.')
       }
+
+      // Cache successful model
+      cachedModel = model
 
       return translatedText.trim()
     } catch (err: unknown) {
@@ -107,3 +130,6 @@ export async function translateWithGemini({
 
   throw lastError || new Error('Gemini API 호출에 실패했습니다.')
 }
+
+let cachedModel: string | null = 'gemini-3.6-flash'
+
