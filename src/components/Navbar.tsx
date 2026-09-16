@@ -1,10 +1,12 @@
 import React from 'react'
 import { Languages, LogOut, Radio, UserCheck } from 'lucide-react'
+import type { TranslationEngine } from '../types'
 
 interface NavbarProps {
   isListening: boolean
   isPaused: boolean
   totalSentences: number
+  engine: TranslationEngine
   onLogout: () => void
 }
 
@@ -12,6 +14,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   isListening,
   isPaused,
   totalSentences,
+  engine,
   onLogout,
 }) => {
   return (
@@ -27,10 +30,17 @@ export const Navbar: React.FC<NavbarProps> = ({
               <h1 className="text-base sm:text-lg font-bold text-slate-900 leading-tight">
                 AI 실시간 음성인식 & 자막 번역기
               </h1>
-              <span className="hidden sm:inline-flex px-2 py-0.5 text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-200 rounded-md">
-                Gemini 3.6 Flash
-              </span>
+              {engine === 'gemini' ? (
+                <span className="hidden sm:inline-flex px-2 py-0.5 text-[11px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-200 rounded-md">
+                  Gemini 3.6 Flash
+                </span>
+              ) : (
+                <span className="hidden sm:inline-flex px-2 py-0.5 text-[11px] font-semibold bg-blue-50 text-blue-700 border border-blue-200 rounded-md">
+                  DeepL Translate
+                </span>
+              )}
             </div>
+
             <p className="text-xs text-slate-500 hidden md:block">
               Web Speech API 실시간 음성인식(STT) 및 인공지능 동시통역 시스템
             </p>

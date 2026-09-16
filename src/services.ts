@@ -133,3 +133,93 @@ export async function translateWithGemini({
 
 let cachedModel: string | null = 'gemini-3.6-flash'
 
+export interface DeepLTranslationParams {
+  text: string
+  sourceLangCode: string
+  targetLangCode: string
+  apiKey: string
+}
+
+export function toDeepLSourceLang(code: string): string {
+  const map: Record<string, string> = {
+    'pt-BR': 'PT',
+    'ko-KR': 'KO',
+    'en-US': 'EN',
+    'es-ES': 'ES',
+    'ja-JP': 'JA',
+    'zh-CN': 'ZH',
+    'fr-FR': 'FR',
+    'de-DE': 'DE',
+    'it-IT': 'IT',
+    'ru-RU': 'RU',
+    'id-ID': 'ID',
+    'ar-SA': 'AR',
+  }
+  return map[code] || code.split('-')[0].toUpperCase()
+}
+
+export function toDeepLTargetLang(code: string): string {
+  const map: Record<string, string> = {
+    'pt-BR': 'PT-BR',
+    'ko-KR': 'KO',
+    'en-US': 'EN-US',
+    'es-ES': 'ES',
+    'ja-JP': 'JA',
+    'zh-CN': 'ZH',
+    'fr-FR': 'FR',
+    'de-DE': 'DE',
+    'it-IT': 'IT',
+    'ru-RU': 'RU',
+    'id-ID': 'ID',
+    'ar-SA': 'AR',
+  }
+  return map[code] || code.toUpperCase()
+}
+
+export async function translateWithDeepL({
+  text,
+  sourceLangCode,
+  targetLangCode,
+  apiKey,
+}: DeepLTranslationParams): Promise<string> {
+  const trimmedKey = apiKey.trim()
+  if (!trimmedKey) {
+    throw new Error('DeepL API Key를 입력해주세요.')
+  }
+
+  const sourceLang = toDeepLSourceLang(sourceLangCode)
+  const targetLang = toDeepLTargetLang(targetLangCode)
+
+  try {
+    const response = await fetch('/api/deepl', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        text,
+        sourceLang,
+        targetLang,
+        apiKey: trimmedKey,
+      }),
+    })
+
+    const data = await response.json().catch(() => ({}))
+
+    if (!response.ok) {
+      throw new Error(data.error || `DeepL 번역 요청 실패 (${response.status})`)
+    }
+
+    if (!data.translatedText) {
+      throw new Error('DeepL 번역 결과를 수신하지 못했습니다.')
+    }
+
+    return data.translatedText.trim()
+  } catch (err: unknown) {
+    if (err instanceof Error) {
+      throw err
+    }
+    throw new Error('DeepL 번역 처리 중 오류가 발생했습니다.')
+  }
+}
+

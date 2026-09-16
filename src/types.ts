@@ -21,3 +21,6 @@ export interface ToastMessage {
   type: 'info' | 'success' | 'warning' | 'error'
   message: string
 }
+
+export type TranslationEngine = 'gemini' | 'deepl'
+

@@ -5,14 +5,14 @@ import { ControlBar } from './components/ControlBar'
 import { SubtitlePanel } from './components/SubtitlePanel'
 import { ToastContainer } from './components/ToastContainer'
 import { useSpeechRecognition } from './useSpeechRecognition'
-import { translateWithGemini } from './services'
+import { translateWithGemini, translateWithDeepL } from './services'
 import { exportToHtml, exportToTxt } from './utils'
 import {
   SUPPORTED_LANGUAGES,
   DEFAULT_SOURCE_LANG,
   DEFAULT_TARGET_LANG,
 } from './constants'
-import type { SubtitleItem, FontSize, ToastMessage } from './types'
+import type { SubtitleItem, FontSize, ToastMessage, TranslationEngine } from './types'
 
 export default function App() {
   // 1. Authentication State
@@ -20,24 +20,32 @@ export default function App() {
     return sessionStorage.getItem('admin_authenticated') === 'true'
   })
 
-  // 2. Gemini API Key (stored in localStorage)
-  const [apiKey, setApiKey] = useState<string>(() => {
+  // 2. Translation Engine Selection
+  const [engine, setEngine] = useState<TranslationEngine>(() => {
+    return (localStorage.getItem('translation_engine') as TranslationEngine) || 'gemini'
+  })
+
+  // 3. API Keys (stored in localStorage per engine)
+  const [geminiApiKey, setGeminiApiKey] = useState<string>(() => {
     return localStorage.getItem('gemini_api_key') || ''
+  })
+  const [deeplApiKey, setDeeplApiKey] = useState<string>(() => {
+    return localStorage.getItem('deepl_api_key') || ''
   })
   const keyInputRef = useRef<HTMLInputElement | null>(null)
 
-  // 3. Language Selection (Default: Source = pt-BR, Target = ko-KR)
+  // 4. Language Selection (Default: Source = pt-BR, Target = ko-KR)
   const [sourceLang, setSourceLang] = useState<string>(DEFAULT_SOURCE_LANG)
   const [targetLang, setTargetLang] = useState<string>(DEFAULT_TARGET_LANG)
 
-  // 4. UI & Display Preferences
+  // 5. UI & Display Preferences
   const [fontSize, setFontSize] = useState<FontSize>('md')
   const [autoScroll, setAutoScroll] = useState<boolean>(true)
 
-  // 5. Subtitle Items
+  // 6. Subtitle Items
   const [items, setItems] = useState<SubtitleItem[]>([])
 
-  // 6. Toast Notifications
+  // 7. Toast Notifications
   const [toasts, setToasts] = useState<ToastMessage[]>([])
 
   const addToast = useCallback(
@@ -55,11 +63,30 @@ export default function App() {
     setToasts((prev) => prev.filter((t) => t.id !== id))
   }, [])
 
-  // Persist API Key to localStorage
-  const handleApiKeyChange = (newKey: string) => {
-    setApiKey(newKey)
+  // --- Engine & Key Handlers ---
+  const handleChangeEngine = (newEngine: TranslationEngine) => {
+    setEngine(newEngine)
+    localStorage.setItem('translation_engine', newEngine)
+    addToast(
+      newEngine === 'gemini'
+        ? 'Google Gemini 번역 엔진으로 전환되었습니다.'
+        : 'DeepL 번역 엔진으로 전환되었습니다.',
+      'info'
+    )
+  }
+
+  const handleGeminiApiKeyChange = (newKey: string) => {
+    setGeminiApiKey(newKey)
     localStorage.setItem('gemini_api_key', newKey)
   }
+
+  const handleDeeplApiKeyChange = (newKey: string) => {
+    setDeeplApiKey(newKey)
+    localStorage.setItem('deepl_api_key', newKey)
+  }
+
+  // Active key shortcut
+  const activeApiKey = engine === 'gemini' ? geminiApiKey : deeplApiKey
 
   // Handle Login
   const handleLoginSuccess = () => {
@@ -83,22 +110,37 @@ export default function App() {
     SUPPORTED_LANGUAGES.find((l) => l.code === targetLang) ||
     SUPPORTED_LANGUAGES[1]
 
-  // Translation worker for a given sentence
+  // Translation worker (dispatches to selected engine)
   const processTranslation = useCallback(
     async (
       itemId: string,
       text: string,
+      currentEngine: TranslationEngine,
+      currentSourceLang: string,
       sourceName: string,
       targetName: string,
-      key: string
+      currentTargetLang: string,
+      gKey: string,
+      dKey: string
     ) => {
       try {
-        const translated = await translateWithGemini({
-          text,
-          sourceLangName: sourceName,
-          targetLangName: targetName,
-          apiKey: key,
-        })
+        let translated = ''
+
+        if (currentEngine === 'gemini') {
+          translated = await translateWithGemini({
+            text,
+            sourceLangName: sourceName,
+            targetLangName: targetName,
+            apiKey: gKey,
+          })
+        } else {
+          translated = await translateWithDeepL({
+            text,
+            sourceLangCode: currentSourceLang,
+            targetLangCode: currentTargetLang,
+            apiKey: dKey,
+          })
+        }
 
         setItems((prev) =>
           prev.map((item) =>
@@ -144,32 +186,53 @@ export default function App() {
       })
       const newItemId = `${Date.now()}-${Math.random().toString(36).substr(2, 6)}`
 
+      // Get current key values via functional update to avoid stale closure
+      const curGeminiKey = geminiApiKey
+      const curDeeplKey = deeplApiKey
+      const curEngine = engine
+      const curActiveKey = curEngine === 'gemini' ? curGeminiKey : curDeeplKey
+
       const newItem: SubtitleItem = {
         id: newItemId,
         timestamp,
         sourceText: sentence,
         translatedText: '',
-        status: apiKey.trim() ? 'translating' : 'pending',
+        status: curActiveKey.trim() ? 'translating' : 'pending',
       }
 
       setItems((prev) => [...prev, newItem])
 
-      if (apiKey.trim()) {
+      if (curActiveKey.trim()) {
         processTranslation(
           newItemId,
           sentence,
+          curEngine,
+          sourceLang,
           sourceLangObj.name,
           targetLangObj.name,
-          apiKey
+          targetLang,
+          curGeminiKey,
+          curDeeplKey
         )
       } else {
+        const engineLabel = curEngine === 'gemini' ? 'Gemini' : 'DeepL'
         addToast(
-          'Gemini API Key가 등록되지 않아 번역이 지연되었습니다. 상단에 Key를 입력해주세요.',
+          `${engineLabel} API Key가 등록되지 않아 번역이 지연되었습니다. 상단에 Key를 입력해주세요.`,
           'warning'
         )
       }
     },
-    [apiKey, sourceLangObj.name, targetLangObj.name, processTranslation, addToast]
+    [
+      engine,
+      geminiApiKey,
+      deeplApiKey,
+      sourceLang,
+      targetLang,
+      sourceLangObj.name,
+      targetLangObj.name,
+      processTranslation,
+      addToast,
+    ]
   )
 
   const handleSpeechError = useCallback(
@@ -196,8 +259,12 @@ export default function App() {
 
   // Start Button Handler with API Key validation
   const handleStart = () => {
-    if (!apiKey.trim()) {
-      addToast('Gemini API Key를 입력해주세요. 상단 입력창에 키를 입력해야 실시간 번역이 가능합니다.', 'warning')
+    if (!activeApiKey.trim()) {
+      const engineLabel = engine === 'gemini' ? 'Gemini' : 'DeepL'
+      addToast(
+        `${engineLabel} API Key를 입력해주세요. 상단 입력창에 키를 입력해야 실시간 번역이 가능합니다.`,
+        'warning'
+      )
       keyInputRef.current?.focus()
       return
     }
@@ -224,8 +291,9 @@ export default function App() {
     const item = items.find((i) => i.id === id)
     if (!item) return
 
-    if (!apiKey.trim()) {
-      addToast('Gemini API Key를 먼저 입력해주세요.', 'warning')
+    if (!activeApiKey.trim()) {
+      const engineLabel = engine === 'gemini' ? 'Gemini' : 'DeepL'
+      addToast(`${engineLabel} API Key를 먼저 입력해주세요.`, 'warning')
       keyInputRef.current?.focus()
       return
     }
@@ -241,9 +309,13 @@ export default function App() {
     processTranslation(
       id,
       item.sourceText,
+      engine,
+      sourceLang,
       sourceLangObj.name,
       targetLangObj.name,
-      apiKey
+      targetLang,
+      geminiApiKey,
+      deeplApiKey
     )
   }
 
@@ -284,6 +356,7 @@ export default function App() {
         isListening={isListening}
         isPaused={isPaused}
         totalSentences={items.length}
+        engine={engine}
         onLogout={handleLogout}
       />
 
@@ -291,8 +364,12 @@ export default function App() {
       <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8 flex flex-col gap-5">
         {/* Control Bar */}
         <ControlBar
-          apiKey={apiKey}
-          onApiKeyChange={handleApiKeyChange}
+          engine={engine}
+          onChangeEngine={handleChangeEngine}
+          geminiApiKey={geminiApiKey}
+          onGeminiApiKeyChange={handleGeminiApiKeyChange}
+          deeplApiKey={deeplApiKey}
+          onDeeplApiKeyChange={handleDeeplApiKeyChange}
           sourceLang={sourceLang}
           onSourceLangChange={setSourceLang}
           targetLang={targetLang}
@@ -324,6 +401,7 @@ export default function App() {
           fontSize={fontSize}
           autoScroll={autoScroll}
           isListening={isListening}
+          engine={engine}
           onRetryTranslation={handleRetryTranslation}
         />
       </main>
@@ -333,4 +411,5 @@ export default function App() {
     </div>
   )
 }
+
 

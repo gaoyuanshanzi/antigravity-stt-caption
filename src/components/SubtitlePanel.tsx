@@ -8,7 +8,7 @@ import {
   Volume2,
   AlertCircle,
 } from 'lucide-react'
-import type { SubtitleItem, Language, FontSize } from '../types'
+import type { SubtitleItem, Language, FontSize, TranslationEngine } from '../types'
 
 interface SubtitlePanelProps {
   items: SubtitleItem[]
@@ -18,6 +18,7 @@ interface SubtitlePanelProps {
   fontSize: FontSize
   autoScroll: boolean
   isListening: boolean
+  engine?: TranslationEngine
   onRetryTranslation: (id: string) => void
 }
 
@@ -29,6 +30,7 @@ export const SubtitlePanel: React.FC<SubtitlePanelProps> = ({
   fontSize,
   autoScroll,
   isListening,
+  engine = 'gemini',
   onRetryTranslation,
 }) => {
   const leftScrollRef = useRef<HTMLDivElement>(null)
@@ -190,7 +192,7 @@ export const SubtitlePanel: React.FC<SubtitlePanelProps> = ({
             <span className="text-xl">{targetLang.flag}</span>
             <div>
               <h2 className="text-sm font-bold text-slate-800 flex items-center gap-1.5">
-                <span>동시 번역 자막 (Gemini)</span>
+                <span>동시 번역 자막 ({engine === 'deepl' ? 'DeepL' : 'Gemini'})</span>
                 <span className="text-xs font-normal text-slate-500">
                   - {targetLang.name}
                 </span>
@@ -198,9 +200,15 @@ export const SubtitlePanel: React.FC<SubtitlePanelProps> = ({
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <span className="flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200">
+            <span
+              className={`flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-semibold border ${
+                engine === 'deepl'
+                  ? 'bg-blue-50 text-blue-700 border-blue-200'
+                  : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+              }`}
+            >
               <Sparkles className="w-3 h-3 text-emerald-600" />
-              AI 실시간 통역
+              {engine === 'deepl' ? 'DeepL 번역' : 'Gemini AI 통역'}
             </span>
           </div>
         </div>
