@@ -180,6 +180,89 @@ export default defineConfig({
             }
           })
         })
+
+        // Neon.tech Database Records List & Retrieve Middleware
+        server.middlewares.use('/api/records', async (req, res) => {
+          if (req.method === 'OPTIONS') {
+            res.statusCode = 200
+            res.setHeader('Access-Control-Allow-Origin', '*')
+            res.setHeader('Access-Control-Allow-Methods', 'GET,DELETE,OPTIONS')
+            res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+            res.end()
+            return
+          }
+
+          const NEON_DB_URL =
+            process.env.NEON_DATABASE_URL ||
+            'postgresql://neondb_owner:npg_g0xtNa5EYyeW@ep-floral-hill-b52g6zf3-pooler.c-7.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require'
+
+          res.setHeader('Content-Type', 'application/json')
+          try {
+            const { neon } = await import('@neondatabase/serverless')
+            const sql = neon(NEON_DB_URL)
+
+            const urlObj = new URL(req.url || '', 'http://localhost')
+            const idParam = urlObj.searchParams.get('id')
+
+            if (req.method === 'GET') {
+              if (idParam) {
+                const recordId = parseInt(idParam, 10)
+                const rows = await sql`
+                  SELECT id, record_type, filename, source_lang, target_lang, sentence_count, content_text, audio_base64, created_at
+                  FROM captions_archive
+                  WHERE id = ${recordId}
+                `
+                if (rows.length === 0) {
+                  res.statusCode = 404
+                  res.end(JSON.stringify({ error: '파일을 찾을 수 없습니다.' }))
+                  return
+                }
+                res.statusCode = 200
+                res.end(JSON.stringify({ record: rows[0] }))
+                return
+              }
+
+              // List records
+              const rows = await sql`
+                SELECT 
+                  id, 
+                  record_type, 
+                  filename, 
+                  source_lang, 
+                  target_lang, 
+                  sentence_count, 
+                  created_at,
+                  LENGTH(COALESCE(content_text, '')) as content_length,
+                  CASE WHEN audio_base64 IS NOT NULL THEN LENGTH(audio_base64) ELSE 0 END as audio_length
+                FROM captions_archive
+                ORDER BY created_at DESC
+              `
+              res.statusCode = 200
+              res.end(JSON.stringify({ records: rows }))
+              return
+            }
+
+            if (req.method === 'DELETE') {
+              if (!idParam) {
+                res.statusCode = 400
+                res.end(JSON.stringify({ error: '삭제할 파일 id가 필요합니다.' }))
+                return
+              }
+              const recordId = parseInt(idParam, 10)
+              await sql`DELETE FROM captions_archive WHERE id = ${recordId}`
+              res.statusCode = 200
+              res.end(JSON.stringify({ success: true, message: '파일이 삭제되었습니다.' }))
+              return
+            }
+
+            res.statusCode = 405
+            res.end(JSON.stringify({ error: 'Method Not Allowed' }))
+          } catch (err: any) {
+            console.error('Records API error:', err)
+            res.statusCode = 500
+            res.end(JSON.stringify({ error: err.message || 'Neon DB 조회 오류' }))
+          }
+        })
       },
     },
   ],

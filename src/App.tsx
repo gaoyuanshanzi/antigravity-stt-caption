@@ -1,10 +1,13 @@
-import { useState, useRef, useCallback } from 'react'
+import { useState, useRef, useCallback, useEffect } from 'react'
 import { LoginModal } from './components/LoginModal'
 import { Navbar } from './components/Navbar'
 import { ControlBar } from './components/ControlBar'
 import { SubtitlePanel } from './components/SubtitlePanel'
 import { ToastContainer } from './components/ToastContainer'
 import { SaveModal } from './components/SaveModal'
+import { FileExplorerSidebar } from './components/FileExplorerSidebar'
+import { AudioPlayerModal } from './components/AudioPlayerModal'
+import { NotepadModal } from './components/NotepadModal'
 import { useSpeechRecognition } from './useSpeechRecognition'
 import { useAudioRecorder } from './useAudioRecorder'
 import { translateWithGemini, translateWithDeepL } from './services'
@@ -14,6 +17,11 @@ import {
   triggerDownload,
   blobToBase64,
   saveRecordToNeon,
+  fetchNeonRecords,
+  fetchNeonRecordDetail,
+  deleteNeonRecord,
+  base64ToBlob,
+  saveAsWithPicker,
 } from './utils'
 import {
   SUPPORTED_LANGUAGES,
@@ -27,6 +35,7 @@ import type {
   TranslationEngine,
   SaveFileType,
   SaveDestination,
+  NeonArchiveRecord,
 } from './types'
 
 export default function App() {
@@ -72,6 +81,44 @@ export default function App() {
   const [modalData, setModalData] = useState<ModalSaveData | null>(null)
   const [isSavingRecord, setIsSavingRecord] = useState<boolean>(false)
 
+  // 8. Neon DB Explorer & Viewer State
+  const [neonRecords, setNeonRecords] = useState<NeonArchiveRecord[]>([])
+  const [isLoadingRecords, setIsLoadingRecords] = useState<boolean>(false)
+
+  const [audioPlayerState, setAudioPlayerState] = useState<{
+    isOpen: boolean
+    filename: string
+    audioUrl: string
+    sourceLang?: string
+    targetLang?: string
+    createdAt?: string
+  } | null>(null)
+
+  const [notepadState, setNotepadState] = useState<{
+    isOpen: boolean
+    filename: string
+    content: string
+    createdAt?: string
+    sentenceCount?: number
+    record?: NeonArchiveRecord
+  } | null>(null)
+
+  const loadRecords = useCallback(async () => {
+    setIsLoadingRecords(true)
+    try {
+      const recs = await fetchNeonRecords()
+      setNeonRecords(recs)
+    } catch (err: any) {
+      console.warn('Failed to load neon records:', err)
+    } finally {
+      setIsLoadingRecords(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    loadRecords()
+  }, [loadRecords])
+
   const {
     startRecording: startAudioRecording,
     pauseRecording: pauseAudioRecording,
@@ -80,7 +127,7 @@ export default function App() {
     discardRecording: discardAudioRecording,
   } = useAudioRecorder()
 
-  // 8. Toast Notifications
+  // 9. Toast Notifications
   const [toasts, setToasts] = useState<ToastMessage[]>([])
 
   const addToast = useCallback(
@@ -517,12 +564,107 @@ export default function App() {
         addToast(`로컬 다운로드 폴더에 저장되었습니다. (${filename})`, 'success')
       }
 
+      if (savedNeon) {
+        loadRecords()
+      }
+
       setModalData(null)
     } catch (err: any) {
       console.error('Save failed:', err)
       addToast(`저장 처리 실패: ${err.message || '오류 발생'}`, 'error')
     } finally {
       setIsSavingRecord(false)
+    }
+  }
+
+  // Double Click Handler (MP3: audio play, HTML: open in browser, TXT: open notepad viewer)
+  const handleDoubleClickRecord = async (record: NeonArchiveRecord) => {
+    try {
+      addToast(`'${record.filename}' 불러오는 중...`, 'info')
+      const detail = await fetchNeonRecordDetail(record.id)
+
+      if (record.record_type === 'audio_mp3') {
+        if (!detail.audio_base64) {
+          addToast('음성 오디오 데이터가 존재하지 않습니다.', 'warning')
+          return
+        }
+        const blob = base64ToBlob(detail.audio_base64, 'audio/mp3')
+        const audioUrl = URL.createObjectURL(blob)
+        setAudioPlayerState({
+          isOpen: true,
+          filename: detail.filename,
+          audioUrl,
+          sourceLang: detail.source_lang,
+          targetLang: detail.target_lang,
+          createdAt: detail.created_at,
+        })
+      } else if (record.record_type === 'html') {
+        if (!detail.content_text) {
+          addToast('HTML 본문 데이터가 존재하지 않습니다.', 'warning')
+          return
+        }
+        const blob = new Blob([detail.content_text], { type: 'text/html;charset=utf-8' })
+        const url = URL.createObjectURL(blob)
+        window.open(url, '_blank')
+        addToast('브라우저 새 탭에서 HTML 자막 문서를 열었습니다.', 'success')
+      } else if (record.record_type === 'txt') {
+        setNotepadState({
+          isOpen: true,
+          filename: detail.filename,
+          content: detail.content_text || '',
+          createdAt: detail.created_at,
+          sentenceCount: detail.sentence_count,
+          record: detail,
+        })
+      }
+    } catch (err: any) {
+      console.error('Failed to open record:', err)
+      addToast(`파일 열기 실패: ${err.message || '오류'}`, 'error')
+    }
+  }
+
+  // Right Click Save As Handler (Using showSaveFilePicker with fallback)
+  const handleSaveAsRecord = async (record: NeonArchiveRecord) => {
+    try {
+      addToast(`'${record.filename}' 다른 이름으로 저장 준비 중...`, 'info')
+      const detail = await fetchNeonRecordDetail(record.id)
+
+      let blob: Blob
+      let mimeType = 'text/plain'
+
+      if (record.record_type === 'audio_mp3') {
+        if (!detail.audio_base64) {
+          addToast('저장할 오디오 데이터가 없습니다.', 'warning')
+          return
+        }
+        mimeType = 'audio/mp3'
+        blob = base64ToBlob(detail.audio_base64, mimeType)
+      } else if (record.record_type === 'html') {
+        mimeType = 'text/html'
+        blob = new Blob([detail.content_text || ''], { type: 'text/html;charset=utf-8' })
+      } else {
+        mimeType = 'text/plain'
+        blob = new Blob([detail.content_text || ''], { type: 'text/plain;charset=utf-8' })
+      }
+
+      await saveAsWithPicker(blob, detail.filename, mimeType)
+      addToast(`'${detail.filename}' 다른 이름으로 저장이 완료되었습니다.`, 'success')
+    } catch (err: any) {
+      console.error('Save As error:', err)
+      addToast(`다른 이름으로 저장 실패: ${err.message || '오류'}`, 'error')
+    }
+  }
+
+  // Delete Record Handler
+  const handleDeleteRecord = async (record: NeonArchiveRecord) => {
+    if (window.confirm(`'${record.filename}' 파일을 Neon DB에서 완전히 삭제하시겠습니까?`)) {
+      try {
+        await deleteNeonRecord(record.id)
+        addToast(`'${record.filename}' 파일이 삭제되었습니다.`, 'info')
+        loadRecords()
+      } catch (err: any) {
+        addToast(`삭제 실패: ${err.message || '오류'}`, 'error')
+      }
     }
   }
 
@@ -535,7 +677,7 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-800 flex flex-col antialiased">
+    <div className="h-screen bg-slate-50 text-slate-800 flex flex-col antialiased overflow-hidden">
       {/* 1. Admin Login Gate */}
       {!isAuthenticated && <LoginModal onLoginSuccess={handleLoginSuccess} />}
 
@@ -548,51 +690,64 @@ export default function App() {
         onLogout={handleLogout}
       />
 
-      {/* 3. Main Container */}
-      <main className="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8 flex flex-col gap-5">
-        {/* Control Bar */}
-        <ControlBar
-          engine={engine}
-          onChangeEngine={handleChangeEngine}
-          geminiApiKey={geminiApiKey}
-          onGeminiApiKeyChange={handleGeminiApiKeyChange}
-          deeplApiKey={deeplApiKey}
-          onDeeplApiKeyChange={handleDeeplApiKeyChange}
-          sourceLang={sourceLang}
-          onSourceLangChange={setSourceLang}
-          targetLang={targetLang}
-          onTargetLangChange={setTargetLang}
-          onSwapLanguages={handleSwapLanguages}
-          isListening={isListening}
-          isPaused={isPaused}
-          onStart={handleStart}
-          onPause={handlePause}
-          onResume={handleResume}
-          onStop={handleStop}
-          autoScroll={autoScroll}
-          onToggleAutoScroll={() => setAutoScroll((prev) => !prev)}
-          fontSize={fontSize}
-          onChangeFontSize={setFontSize}
-          onExportHtml={handleExportHtml}
-          onExportTxt={handleExportTxt}
-          onClear={handleClear}
-          hasItems={items.length > 0}
-          keyInputRef={keyInputRef}
+      {/* 3. Main Workspace Container with Left Sidebar & Center Dashboard */}
+      <div className="flex-1 flex overflow-hidden">
+        {/* Left Directory Explorer (Neon DB Archive) */}
+        <FileExplorerSidebar
+          records={neonRecords}
+          isLoading={isLoadingRecords}
+          onRefresh={loadRecords}
+          onDoubleClickFile={handleDoubleClickRecord}
+          onSaveAsFile={handleSaveAsRecord}
+          onDeleteFile={handleDeleteRecord}
         />
 
-        {/* Subtitle Dual Panels */}
-        <SubtitlePanel
-          items={items}
-          interimText={interimText}
-          sourceLang={sourceLangObj}
-          targetLang={targetLangObj}
-          fontSize={fontSize}
-          autoScroll={autoScroll}
-          isListening={isListening}
-          engine={engine}
-          onRetryTranslation={handleRetryTranslation}
-        />
-      </main>
+        {/* Center Main Dashboard */}
+        <main className="flex-1 overflow-y-auto p-4 sm:p-6 lg:p-8 flex flex-col gap-5 max-w-7xl mx-auto w-full">
+          {/* Control Bar */}
+          <ControlBar
+            engine={engine}
+            onChangeEngine={handleChangeEngine}
+            geminiApiKey={geminiApiKey}
+            onGeminiApiKeyChange={handleGeminiApiKeyChange}
+            deeplApiKey={deeplApiKey}
+            onDeeplApiKeyChange={handleDeeplApiKeyChange}
+            sourceLang={sourceLang}
+            onSourceLangChange={setSourceLang}
+            targetLang={targetLang}
+            onTargetLangChange={setTargetLang}
+            onSwapLanguages={handleSwapLanguages}
+            isListening={isListening}
+            isPaused={isPaused}
+            onStart={handleStart}
+            onPause={handlePause}
+            onResume={handleResume}
+            onStop={handleStop}
+            autoScroll={autoScroll}
+            onToggleAutoScroll={() => setAutoScroll((prev) => !prev)}
+            fontSize={fontSize}
+            onChangeFontSize={setFontSize}
+            onExportHtml={handleExportHtml}
+            onExportTxt={handleExportTxt}
+            onClear={handleClear}
+            hasItems={items.length > 0}
+            keyInputRef={keyInputRef}
+          />
+
+          {/* Subtitle Dual Panels */}
+          <SubtitlePanel
+            items={items}
+            interimText={interimText}
+            sourceLang={sourceLangObj}
+            targetLang={targetLangObj}
+            fontSize={fontSize}
+            autoScroll={autoScroll}
+            isListening={isListening}
+            engine={engine}
+            onRetryTranslation={handleRetryTranslation}
+          />
+        </main>
+      </div>
 
       {/* 4. Save Modal (MP3 / HTML / TXT) */}
       {modalData && (
@@ -607,7 +762,42 @@ export default function App() {
         />
       )}
 
-      {/* 5. Global Toast Notifications */}
+      {/* 5. Audio Player Modal (MP3 Double-Click) */}
+      {audioPlayerState && (
+        <AudioPlayerModal
+          isOpen={audioPlayerState.isOpen}
+          filename={audioPlayerState.filename}
+          audioUrl={audioPlayerState.audioUrl}
+          sourceLang={audioPlayerState.sourceLang}
+          targetLang={audioPlayerState.targetLang}
+          createdAt={audioPlayerState.createdAt}
+          onClose={() => setAudioPlayerState(null)}
+        />
+      )}
+
+      {/* 6. Notepad Modal (TXT Double-Click) */}
+      {notepadState && (
+        <NotepadModal
+          isOpen={notepadState.isOpen}
+          filename={notepadState.filename}
+          content={notepadState.content}
+          createdAt={notepadState.createdAt}
+          sentenceCount={notepadState.sentenceCount}
+          onClose={() => setNotepadState(null)}
+          onSaveAs={() => {
+            if (notepadState.record) {
+              handleSaveAsRecord(notepadState.record)
+            } else {
+              const blob = new Blob([notepadState.content], {
+                type: 'text/plain;charset=utf-8',
+              })
+              saveAsWithPicker(blob, notepadState.filename, 'text/plain')
+            }
+          }}
+        />
+      )}
+
+      {/* 7. Global Toast Notifications */}
       <ToastContainer toasts={toasts} onDismiss={removeToast} />
     </div>
   )

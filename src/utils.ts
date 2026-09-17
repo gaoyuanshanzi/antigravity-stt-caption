@@ -61,6 +61,97 @@ export async function saveRecordToNeon(payload: SaveRecordPayload): Promise<{
   return data
 }
 
+export async function fetchNeonRecords(): Promise<import('./types').NeonArchiveRecord[]> {
+  const response = await fetch('/api/records', {
+    method: 'GET',
+    headers: { 'Content-Type': 'application/json' },
+  })
+  const data = await response.json().catch(() => ({}))
+  if (!response.ok) {
+    throw new Error(data.error || 'Neon DB 파일 목록 조회 실패')
+  }
+  return data.records || []
+}
+
+export async function fetchNeonRecordDetail(id: number): Promise<import('./types').NeonArchiveRecord> {
+  const response = await fetch(`/api/records?id=${id}`, {
+    method: 'GET',
+    headers: { 'Content-Type': 'application/json' },
+  })
+  const data = await response.json().catch(() => ({}))
+  if (!response.ok) {
+    throw new Error(data.error || '파일 내용 불러오기 실패')
+  }
+  return data.record
+}
+
+export async function deleteNeonRecord(id: number): Promise<void> {
+  const response = await fetch(`/api/records?id=${id}`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+  })
+  const data = await response.json().catch(() => ({}))
+  if (!response.ok) {
+    throw new Error(data.error || '파일 삭제 실패')
+  }
+}
+
+export function base64ToBlob(base64: string, mimeType: string): Blob {
+  const base64Data = base64.includes(',') ? base64.split(',')[1] : base64
+  const byteCharacters = atob(base64Data)
+  const byteArrays: Uint8Array[] = []
+
+  const sliceSize = 512
+  for (let offset = 0; offset < byteCharacters.length; offset += sliceSize) {
+    const slice = byteCharacters.slice(offset, offset + sliceSize)
+    const byteNumbers = new Array(slice.length)
+    for (let i = 0; i < slice.length; i++) {
+      byteNumbers[i] = slice.charCodeAt(i)
+    }
+    byteArrays.push(new Uint8Array(byteNumbers))
+  }
+
+  return new Blob(byteArrays as BlobPart[], { type: mimeType })
+}
+
+export async function saveAsWithPicker(
+  blob: Blob,
+  defaultFilename: string,
+  mimeType: string
+): Promise<void> {
+  if ('showSaveFilePicker' in window) {
+    try {
+      const ext = defaultFilename.includes('.')
+        ? '.' + defaultFilename.split('.').pop()
+        : ''
+      const handle = await (window as any).showSaveFilePicker({
+        suggestedName: defaultFilename,
+        types: [
+          {
+            description: '파일',
+            accept: {
+              [mimeType]: [ext],
+            },
+          },
+        ],
+      })
+      const writable = await handle.createWritable()
+      await writable.write(blob)
+      await writable.close()
+      return
+    } catch (err: any) {
+      if (err.name === 'AbortError') {
+        // User cancelled the file picker dialog
+        return
+      }
+      console.warn('showSaveFilePicker failed, fallback to standard download:', err)
+    }
+  }
+
+  // Fallback to standard browser download
+  triggerDownload(blob, defaultFilename, mimeType)
+}
+
 export function generateHtmlContent(
   items: SubtitleItem[],
   sourceLang: Language,
