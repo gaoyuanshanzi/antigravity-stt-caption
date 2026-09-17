@@ -24,3 +24,15 @@ export interface ToastMessage {
 
 export type TranslationEngine = 'gemini' | 'deepl'
 
+export type SaveFileType = 'mp3' | 'html' | 'txt'
+export type SaveDestination = 'neon' | 'local' | 'both'
+
+export interface SaveRecordPayload {
+  record_type: 'html' | 'txt' | 'audio_mp3'
+  filename: string
+  source_lang?: string
+  target_lang?: string
+  sentence_count?: number
+  content_text?: string | null
+  audio_base64?: string | null
+}

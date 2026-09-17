@@ -4,15 +4,30 @@ import { Navbar } from './components/Navbar'
 import { ControlBar } from './components/ControlBar'
 import { SubtitlePanel } from './components/SubtitlePanel'
 import { ToastContainer } from './components/ToastContainer'
+import { SaveModal } from './components/SaveModal'
 import { useSpeechRecognition } from './useSpeechRecognition'
+import { useAudioRecorder } from './useAudioRecorder'
 import { translateWithGemini, translateWithDeepL } from './services'
-import { exportToHtml, exportToTxt } from './utils'
+import {
+  generateHtmlContent,
+  generateTxtContent,
+  triggerDownload,
+  blobToBase64,
+  saveRecordToNeon,
+} from './utils'
 import {
   SUPPORTED_LANGUAGES,
   DEFAULT_SOURCE_LANG,
   DEFAULT_TARGET_LANG,
 } from './constants'
-import type { SubtitleItem, FontSize, ToastMessage, TranslationEngine } from './types'
+import type {
+  SubtitleItem,
+  FontSize,
+  ToastMessage,
+  TranslationEngine,
+  SaveFileType,
+  SaveDestination,
+} from './types'
 
 export default function App() {
   // 1. Authentication State
@@ -45,7 +60,27 @@ export default function App() {
   // 6. Subtitle Items
   const [items, setItems] = useState<SubtitleItem[]>([])
 
-  // 7. Toast Notifications
+  // 7. Save Modal State & Audio Recording
+  interface ModalSaveData {
+    isOpen: boolean
+    fileType: SaveFileType
+    filename: string
+    detailInfo?: string
+    mp3Blob?: Blob
+    textContent?: string
+  }
+  const [modalData, setModalData] = useState<ModalSaveData | null>(null)
+  const [isSavingRecord, setIsSavingRecord] = useState<boolean>(false)
+
+  const {
+    startRecording: startAudioRecording,
+    pauseRecording: pauseAudioRecording,
+    resumeRecording: resumeAudioRecording,
+    stopRecording: stopAudioRecording,
+    discardRecording: discardAudioRecording,
+  } = useAudioRecorder()
+
+  // 8. Toast Notifications
   const [toasts, setToasts] = useState<ToastMessage[]>([])
 
   const addToast = useCallback(
@@ -98,6 +133,7 @@ export default function App() {
   // Handle Logout
   const handleLogout = () => {
     stopListening()
+    discardAudioRecording()
     sessionStorage.removeItem('admin_authenticated')
     setIsAuthenticated(false)
   }
@@ -257,8 +293,8 @@ export default function App() {
     onError: handleSpeechError,
   })
 
-  // Start Button Handler with API Key validation
-  const handleStart = () => {
+  // Start Button Handler with API Key validation & MP3 Recording
+  const handleStart = async () => {
     if (!activeApiKey.trim()) {
       const engineLabel = engine === 'gemini' ? 'Gemini' : 'DeepL'
       addToast(
@@ -270,12 +306,63 @@ export default function App() {
     }
 
     if (!isSupported) {
-      addToast('현재 브라우저에서는 Web Speech API를 지원하지 않습니다. Chrome 브라우저를 이용해주세요.', 'error')
+      addToast(
+        '현재 브라우저에서는 Web Speech API를 지원하지 않습니다. Chrome 브라우저를 이용해주세요.',
+        'error'
+      )
       return
     }
 
-    startListening()
-    addToast('실시간 음성 인식을 시작했습니다. 마이크로 말씀하세요.', 'info')
+    try {
+      await startAudioRecording()
+      startListening()
+      addToast(
+        '실시간 음성 인식 및 MP3 음성 녹음을 시작했습니다. (128 kbps)',
+        'info'
+      )
+    } catch (err: any) {
+      console.warn('Audio recording failed to start:', err)
+      startListening()
+      addToast(
+        '마이크 녹음 권한이 없거나 오류가 발생했습니다. STT 음성인식만 시작합니다.',
+        'warning'
+      )
+    }
+  }
+
+  // Pause STT & Recording
+  const handlePause = () => {
+    pauseListening()
+    pauseAudioRecording()
+    addToast('음성 인식 및 음성 녹음이 일시정지되었습니다.', 'info')
+  }
+
+  // Resume STT & Recording
+  const handleResume = () => {
+    resumeListening()
+    resumeAudioRecording()
+    addToast('음성 인식 및 음성 녹음이 재개되었습니다.', 'info')
+  }
+
+  // Stop STT & Recording -> Prompt to save MP3
+  const handleStop = async () => {
+    stopListening()
+    addToast('음성 인식 및 녹음을 종료합니다. 오디오 변환 중...', 'info')
+    try {
+      const recordResult = await stopAudioRecording()
+      if (recordResult && recordResult.blob && recordResult.blob.size > 0) {
+        setModalData({
+          isOpen: true,
+          fileType: 'mp3',
+          filename: recordResult.filename,
+          detailInfo: `${recordResult.durationSeconds}초 녹음 (${(recordResult.blob.size / 1024).toFixed(1)} KB)`,
+          mp3Blob: recordResult.blob,
+        })
+      }
+    } catch (err: any) {
+      console.error('Stop recording error:', err)
+      addToast(`녹음 파일 처리 중 오류 발생: ${err.message || '오류'}`, 'error')
+    }
   }
 
   // Swap Languages
@@ -319,14 +406,24 @@ export default function App() {
     )
   }
 
-  // Export Handlers
+  // Export Handlers with Save Target Modal
   const handleExportHtml = () => {
     if (items.length === 0) {
       addToast('내보낼 자막 기록이 없습니다.', 'warning')
       return
     }
-    exportToHtml(items, sourceLangObj, targetLangObj)
-    addToast('HTML 자막 기록 파일이 다운로드 폴더에 저장되었습니다.', 'success')
+    const { html, filename } = generateHtmlContent(
+      items,
+      sourceLangObj,
+      targetLangObj
+    )
+    setModalData({
+      isOpen: true,
+      fileType: 'html',
+      filename,
+      detailInfo: `총 ${items.length}개 자막 문장`,
+      textContent: html,
+    })
   }
 
   const handleExportTxt = () => {
@@ -334,8 +431,99 @@ export default function App() {
       addToast('저장할 자막 기록이 없습니다.', 'warning')
       return
     }
-    exportToTxt(items, sourceLangObj, targetLangObj)
-    addToast('TXT 자막 기록 파일이 다운로드 폴더에 저장되었습니다.', 'success')
+    const { text, filename } = generateTxtContent(
+      items,
+      sourceLangObj,
+      targetLangObj
+    )
+    setModalData({
+      isOpen: true,
+      fileType: 'txt',
+      filename,
+      detailInfo: `총 ${items.length}개 자막 문장`,
+      textContent: text,
+    })
+  }
+
+  // Confirm Saving from Modal (Local / Neon DB / Both)
+  const handleConfirmSave = async (destination: SaveDestination) => {
+    if (!modalData) return
+    const { fileType, filename, mp3Blob, textContent } = modalData
+
+    setIsSavingRecord(true)
+    try {
+      let savedLocal = false
+      let savedNeon = false
+
+      // 1. Local Download
+      if (destination === 'local' || destination === 'both') {
+        if (fileType === 'mp3' && mp3Blob) {
+          triggerDownload(mp3Blob, filename, 'audio/mp3')
+          savedLocal = true
+        } else if (fileType === 'html' && textContent) {
+          triggerDownload(textContent, filename, 'text/html')
+          savedLocal = true
+        } else if (fileType === 'txt' && textContent) {
+          triggerDownload(textContent, filename, 'text/plain')
+          savedLocal = true
+        }
+      }
+
+      // 2. Neon DB Save
+      if (destination === 'neon' || destination === 'both') {
+        if (fileType === 'mp3' && mp3Blob) {
+          const base64 = await blobToBase64(mp3Blob)
+          await saveRecordToNeon({
+            record_type: 'audio_mp3',
+            filename,
+            source_lang: sourceLang,
+            target_lang: targetLang,
+            sentence_count: items.length,
+            audio_base64: base64,
+          })
+          savedNeon = true
+        } else if (fileType === 'html' && textContent) {
+          await saveRecordToNeon({
+            record_type: 'html',
+            filename,
+            source_lang: sourceLang,
+            target_lang: targetLang,
+            sentence_count: items.length,
+            content_text: textContent,
+          })
+          savedNeon = true
+        } else if (fileType === 'txt' && textContent) {
+          await saveRecordToNeon({
+            record_type: 'txt',
+            filename,
+            source_lang: sourceLang,
+            target_lang: targetLang,
+            sentence_count: items.length,
+            content_text: textContent,
+          })
+          savedNeon = true
+        }
+      }
+
+      // Show result message
+      if (savedNeon && savedLocal) {
+        addToast(
+          `Neon.tech DB 및 로컬 다운로드 폴더에 모두 저장되었습니다! (${filename})`,
+          'success'
+        )
+      } else if (savedNeon) {
+        addToast(`Neon.tech DB에 안전하게 저장되었습니다. (${filename})`, 'success')
+      } else if (savedLocal) {
+        addToast(`로컬 다운로드 폴더에 저장되었습니다. (${filename})`, 'success')
+      }
+
+      setModalData(null)
+    } catch (err: any) {
+      console.error('Save failed:', err)
+      addToast(`저장 처리 실패: ${err.message || '오류 발생'}`, 'error')
+    } finally {
+      setIsSavingRecord(false)
+    }
   }
 
   // Clear Items
@@ -378,9 +566,9 @@ export default function App() {
           isListening={isListening}
           isPaused={isPaused}
           onStart={handleStart}
-          onPause={pauseListening}
-          onResume={resumeListening}
-          onStop={stopListening}
+          onPause={handlePause}
+          onResume={handleResume}
+          onStop={handleStop}
           autoScroll={autoScroll}
           onToggleAutoScroll={() => setAutoScroll((prev) => !prev)}
           fontSize={fontSize}
@@ -406,10 +594,24 @@ export default function App() {
         />
       </main>
 
-      {/* 4. Global Toast Notifications */}
+      {/* 4. Save Modal (MP3 / HTML / TXT) */}
+      {modalData && (
+        <SaveModal
+          isOpen={modalData.isOpen}
+          fileType={modalData.fileType}
+          filename={modalData.filename}
+          detailInfo={modalData.detailInfo}
+          isSaving={isSavingRecord}
+          onConfirm={handleConfirmSave}
+          onClose={() => setModalData(null)}
+        />
+      )}
+
+      {/* 5. Global Toast Notifications */}
       <ToastContainer toasts={toasts} onDismiss={removeToast} />
     </div>
   )
 }
+
 
 

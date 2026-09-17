@@ -1,6 +1,6 @@
-import type { SubtitleItem, Language } from './types'
+import type { SubtitleItem, Language, SaveRecordPayload } from './types'
 
-function getFormattedDateTime(): string {
+export function getFormattedDateTime(): string {
   const now = new Date()
   const year = now.getFullYear()
   const month = String(now.getMonth() + 1).padStart(2, '0')
@@ -11,8 +11,15 @@ function getFormattedDateTime(): string {
   return `${year}${month}${day}_${hours}${minutes}${seconds}`
 }
 
-function triggerDownload(content: string, filename: string, mimeType: string) {
-  const blob = new Blob([content], { type: `${mimeType};charset=utf-8` })
+export function triggerDownload(
+  content: string | Blob,
+  filename: string,
+  mimeType: string = 'text/plain'
+) {
+  const blob =
+    content instanceof Blob
+      ? content
+      : new Blob([content], { type: `${mimeType};charset=utf-8` })
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
   a.href = url
@@ -23,16 +30,48 @@ function triggerDownload(content: string, filename: string, mimeType: string) {
   URL.revokeObjectURL(url)
 }
 
-export function exportToHtml(
+export async function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onloadend = () => {
+      resolve(reader.result as string)
+    }
+    reader.onerror = reject
+    reader.readAsDataURL(blob)
+  })
+}
+
+export async function saveRecordToNeon(payload: SaveRecordPayload): Promise<{
+  success: boolean
+  message: string
+  record?: any
+}> {
+  const response = await fetch('/api/save-record', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  })
+
+  const data = await response.json().catch(() => ({}))
+  if (!response.ok) {
+    throw new Error(data.error || `Neon DB 저장 실패 (${response.status})`)
+  }
+  return data
+}
+
+export function generateHtmlContent(
   items: SubtitleItem[],
   sourceLang: Language,
   targetLang: Language
-) {
+): { html: string; filename: string } {
   const timestampStr = new Date().toLocaleString('ko-KR', {
     dateStyle: 'full',
     timeStyle: 'medium',
   })
   const filename = `stt_transcript_${getFormattedDateTime()}.html`
+
 
   const rows = items
     .map(
@@ -275,7 +314,40 @@ export function exportToHtml(
 </body>
 </html>`
 
+  return { html, filename }
+}
+
+export function exportToHtml(
+  items: SubtitleItem[],
+  sourceLang: Language,
+  targetLang: Language
+) {
+  const { html, filename } = generateHtmlContent(items, sourceLang, targetLang)
   triggerDownload(html, filename, 'text/html')
+}
+
+export function generateTxtContent(
+  items: SubtitleItem[],
+  sourceLang: Language,
+  targetLang: Language
+): { text: string; filename: string } {
+  const timestampStr = new Date().toLocaleString('ko-KR')
+  const filename = `stt_transcript_${getFormattedDateTime()}.txt`
+
+  let text = `=================================================================\n`
+  text += ` 실시간 음성 인식 & 자막 번역 기록\n`
+  text += ` 일시: ${timestampStr}\n`
+  text += ` 출발어: ${sourceLang.name} (${sourceLang.code})\n`
+  text += ` 도착어: ${targetLang.name} (${targetLang.code})\n`
+  text += ` 총 문장 수: ${items.length}개\n`
+  text += `=================================================================\n\n`
+
+  items.forEach((item, index) => {
+    text += `[${item.timestamp}] [${index + 1}] [원문 (${sourceLang.code})]: ${item.sourceText}\n`
+    text += `[${item.timestamp}] [${index + 1}] [번역 (${targetLang.code})]: ${item.translatedText || '(번역 대기 중)'}\n\n`
+  })
+
+  return { text, filename }
 }
 
 export function exportToTxt(
@@ -283,23 +355,8 @@ export function exportToTxt(
   sourceLang: Language,
   targetLang: Language
 ) {
-  const timestampStr = new Date().toLocaleString('ko-KR')
-  const filename = `stt_transcript_${getFormattedDateTime()}.txt`
-
-  let content = `=================================================================\n`
-  content += ` 실시간 음성 인식 & 자막 번역 기록\n`
-  content += ` 일시: ${timestampStr}\n`
-  content += ` 출발어: ${sourceLang.name} (${sourceLang.code})\n`
-  content += ` 도착어: ${targetLang.name} (${targetLang.code})\n`
-  content += ` 총 문장 수: ${items.length}개\n`
-  content += `=================================================================\n\n`
-
-  items.forEach((item, index) => {
-    content += `[${item.timestamp}] [${index + 1}] [원문 (${sourceLang.code})]: ${item.sourceText}\n`
-    content += `[${item.timestamp}] [${index + 1}] [번역 (${targetLang.code})]: ${item.translatedText || '(번역 대기 중)'}\n\n`
-  })
-
-  triggerDownload(content, filename, 'text/plain')
+  const { text, filename } = generateTxtContent(items, sourceLang, targetLang)
+  triggerDownload(text, filename, 'text/plain')
 }
 
 function escapeHtml(str: string): string {
