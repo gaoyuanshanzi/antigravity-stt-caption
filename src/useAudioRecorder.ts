@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback } from 'react'
-import lamejs from 'lamejs'
+import { Mp3Encoder } from '@breezystack/lamejs'
 
 interface AudioRecordResult {
   blob: Blob
@@ -171,14 +171,6 @@ export function useAudioRecorder() {
           const channels = Math.min(audioBuffer.numberOfChannels, 2)
           const sampleRate = audioBuffer.sampleRate
           const kbps = 128 // 128 kbps requested by user
-
-          const Mp3Encoder =
-            (lamejs as any).Mp3Encoder ||
-            (lamejs as any).default?.Mp3Encoder
-
-          if (!Mp3Encoder) {
-            throw new Error('MP3 인코더 모듈을 로드할 수 없습니다.')
-          }
 
           const encoder = new Mp3Encoder(channels, sampleRate, kbps)
           const mp3Chunks: Uint8Array[] = []
