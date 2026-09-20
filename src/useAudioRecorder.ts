@@ -251,7 +251,7 @@ export function useAudioRecorder({
           }
           const rms = Math.sqrt(sumSquare / downsampled.length)
           const now = Date.now()
-          const isVoice = rms >= 0.012
+          const isVoice = rms >= 0.009
 
           if (isVoice) {
             if (!isSpeakingRef.current) {
@@ -281,7 +281,7 @@ export function useAudioRecorder({
               if (now - lastSpeechTimeRef.current >= 750) {
                 const speechDuration =
                   lastSpeechTimeRef.current - speechStartTimeRef.current
-                if (speechDuration >= 350) {
+                if (speechDuration >= 280) {
                   emitCurrentPhrase()
                 } else {
                   phrasePcmBuffersRef.current = []
@@ -361,6 +361,9 @@ export function useAudioRecorder({
   const stopRecording = useCallback(async (): Promise<AudioRecordResult | null> => {
     isRecordingRef.current = false
     isPausedRef.current = false
+    if (phrasePcmBuffersRef.current.length > 0) {
+      emitCurrentPhrase()
+    }
     cleanupVad()
 
     return new Promise((resolve, reject) => {

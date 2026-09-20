@@ -232,7 +232,7 @@ export interface AudioTranscriptionParams {
 
 export async function transcribeAudioWithGemini({
   audioBase64,
-  mimeType = 'audio/webm',
+  mimeType = 'audio/wav',
   sourceLangName,
   apiKey,
 }: AudioTranscriptionParams): Promise<string> {
@@ -245,7 +245,7 @@ export async function transcribeAudioWithGemini({
     ? audioBase64.split(',')[1]
     : audioBase64
 
-  const cleanMimeType = mimeType.split(';')[0].trim() || 'audio/webm'
+  const cleanMimeType = mimeType.split(';')[0].trim() || 'audio/wav'
 
   const requestBody = {
     contents: [
@@ -253,27 +253,27 @@ export async function transcribeAudioWithGemini({
         role: 'user',
         parts: [
           {
-            inline_data: {
-              mime_type: cleanMimeType,
-              data: base64Data,
-            },
+            text: `Please transcribe the spoken speech in the audio verbatim into ${sourceLangName}. Output ONLY the transcribed words in ${sourceLangName}. Do NOT include explanations, introductory notes, markdown, or quotation marks. If no clear words are spoken, output nothing.`,
           },
           {
-            text: `You are an expert real-time speech recognition model. Transcribe the spoken audio verbatim in ${sourceLangName}. Output ONLY the transcribed text in ${sourceLangName}. Do NOT include explanations, quotation marks, or timecodes. If the audio is silence or noise with no clear speech, output nothing.`,
+            inlineData: {
+              mimeType: cleanMimeType,
+              data: base64Data,
+            },
           },
         ],
       },
     ],
     generationConfig: {
-      temperature: 0.1,
+      temperature: 0.0,
       maxOutputTokens: 300,
     },
   }
 
   const candidateModels = [
-    'gemini-2.5-flash',
     'gemini-2.0-flash',
     'gemini-1.5-flash',
+    'gemini-2.5-flash',
     'gemini-1.5-flash-latest',
   ]
 
@@ -291,6 +291,8 @@ export async function transcribeAudioWithGemini({
       )
 
       if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}))
+        console.warn(`[Gemini STT] Model ${model} HTTP ${response.status}:`, errorData)
         continue
       }
 
@@ -298,8 +300,12 @@ export async function transcribeAudioWithGemini({
       const text =
         data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || ''
 
-      return text.replace(/^["']|["']$/g, '').trim()
-    } catch {
+      const cleaned = text.replace(/^["'“”‘’]|["'“”‘’]$/g, '').trim()
+      if (cleaned) {
+        return cleaned
+      }
+    } catch (err) {
+      console.warn(`[Gemini STT] Fetch failed for ${model}:`, err)
       continue
     }
   }

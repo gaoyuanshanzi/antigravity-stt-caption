@@ -381,15 +381,22 @@ export default function App() {
         geminiApiKey.trim() ||
         (engine === 'gemini' ? activeApiKey.trim() : '')
 
-      if (!currentGeminiKey) return
+      if (!currentGeminiKey) {
+        addToast(
+          'Gemini API Key가 등록되지 않아 모바일 음성 변환을 완료할 수 없습니다. 상단에 Gemini API Key를 입력해주세요.',
+          'warning'
+        )
+        return
+      }
 
       setIsAudioTranscribing(true)
       try {
         const base64 = await blobToBase64(phraseBlob)
+        const langDescriptor = `${sourceLangObj.name} (${sourceLangObj.nativeName || sourceLangObj.code})`
         const text = await transcribeAudioWithGemini({
           audioBase64: base64,
           mimeType: 'audio/wav',
-          sourceLangName: sourceLangObj.name,
+          sourceLangName: langDescriptor,
           apiKey: currentGeminiKey,
         })
         if (text && text.trim()) {
@@ -401,7 +408,7 @@ export default function App() {
         setIsAudioTranscribing(false)
       }
     },
-    [geminiApiKey, engine, activeApiKey, sourceLangObj.name, handleFinalSentence]
+    [geminiApiKey, engine, activeApiKey, sourceLangObj, handleFinalSentence, addToast]
   )
 
   const handleSpeechDetected = useCallback((isSpeaking: boolean) => {
