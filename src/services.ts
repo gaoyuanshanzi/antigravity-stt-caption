@@ -223,3 +223,88 @@ export async function translateWithDeepL({
   }
 }
 
+export interface AudioTranscriptionParams {
+  audioBase64: string
+  mimeType?: string
+  sourceLangName: string
+  apiKey: string
+}
+
+export async function transcribeAudioWithGemini({
+  audioBase64,
+  mimeType = 'audio/webm',
+  sourceLangName,
+  apiKey,
+}: AudioTranscriptionParams): Promise<string> {
+  const trimmedKey = apiKey.trim()
+  if (!trimmedKey) {
+    return ''
+  }
+
+  const base64Data = audioBase64.includes(',')
+    ? audioBase64.split(',')[1]
+    : audioBase64
+
+  const cleanMimeType = mimeType.split(';')[0].trim() || 'audio/webm'
+
+  const requestBody = {
+    contents: [
+      {
+        role: 'user',
+        parts: [
+          {
+            inline_data: {
+              mime_type: cleanMimeType,
+              data: base64Data,
+            },
+          },
+          {
+            text: `You are an expert real-time speech recognition model. Transcribe the spoken audio verbatim in ${sourceLangName}. Output ONLY the transcribed text in ${sourceLangName}. Do NOT include explanations, quotation marks, or timecodes. If the audio is silence or noise with no clear speech, output nothing.`,
+          },
+        ],
+      },
+    ],
+    generationConfig: {
+      temperature: 0.1,
+      maxOutputTokens: 300,
+    },
+  }
+
+  const candidateModels = [
+    'gemini-2.5-flash',
+    'gemini-2.0-flash',
+    'gemini-1.5-flash',
+    'gemini-1.5-flash-latest',
+  ]
+
+  for (const model of candidateModels) {
+    try {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${trimmedKey}`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(requestBody),
+        }
+      )
+
+      if (!response.ok) {
+        continue
+      }
+
+      const data = await response.json()
+      const text =
+        data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || ''
+
+      return text.replace(/^["']|["']$/g, '').trim()
+    } catch {
+      continue
+    }
+  }
+
+  return ''
+}
+
+

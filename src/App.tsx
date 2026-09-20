@@ -10,7 +10,11 @@ import { AudioPlayerModal } from './components/AudioPlayerModal'
 import { NotepadModal } from './components/NotepadModal'
 import { useSpeechRecognition } from './useSpeechRecognition'
 import { useAudioRecorder } from './useAudioRecorder'
-import { translateWithGemini, translateWithDeepL } from './services'
+import {
+  translateWithGemini,
+  translateWithDeepL,
+  transcribeAudioWithGemini,
+} from './services'
 import {
   generateHtmlContent,
   generateTxtContent,
@@ -119,13 +123,6 @@ export default function App() {
     loadRecords()
   }, [loadRecords])
 
-  const {
-    startRecording: startAudioRecording,
-    pauseRecording: pauseAudioRecording,
-    resumeRecording: resumeAudioRecording,
-    stopRecording: stopAudioRecording,
-    discardRecording: discardAudioRecording,
-  } = useAudioRecorder()
 
   // 9. Toast Notifications
   const [toasts, setToasts] = useState<ToastMessage[]>([])
@@ -257,9 +254,46 @@ export default function App() {
     [addToast]
   )
 
-  // Speech Recognition Hook
+  // Audio Stream Speech Activity & STT states (Mobile & Desktop fallback)
+  const [isAudioSpeaking, setIsAudioSpeaking] = useState<boolean>(false)
+  const [isAudioTranscribing, setIsAudioTranscribing] = useState<boolean>(false)
+  const recentSentencesRef = useRef<Array<{ text: string; time: number }>>([])
+
+  // Speech Recognition & Audio STT Callback
   const handleFinalSentence = useCallback(
-    (sentence: string) => {
+    (sentence: string, _origin: 'web_speech' | 'audio_stream' = 'web_speech') => {
+      const trimmedSentence = sentence.trim()
+      if (!trimmedSentence) return
+
+      // Sentence deduplication check
+      const normalize = (t: string) =>
+        t.toLowerCase().replace(/[.,?!;:~"'`…\s]/g, '')
+      const norm = normalize(trimmedSentence)
+      if (!norm) return
+
+      const nowMs = Date.now()
+      // Prune entries older than 8 seconds
+      recentSentencesRef.current = recentSentencesRef.current.filter(
+        (entry) => nowMs - entry.time < 8000
+      )
+
+      const isDuplicate = recentSentencesRef.current.some((entry) => {
+        const entryNorm = normalize(entry.text)
+        if (entryNorm === norm) return true
+        if (nowMs - entry.time < 4500) {
+          if (entryNorm.includes(norm) || norm.includes(entryNorm)) {
+            return true
+          }
+        }
+        return false
+      })
+
+      if (isDuplicate) {
+        return
+      }
+
+      recentSentencesRef.current.push({ text: trimmedSentence, time: nowMs })
+
       const now = new Date()
       const timestamp = now.toLocaleTimeString('ko-KR', {
         hour12: false,
@@ -278,7 +312,7 @@ export default function App() {
       const newItem: SubtitleItem = {
         id: newItemId,
         timestamp,
-        sourceText: sentence,
+        sourceText: trimmedSentence,
         translatedText: '',
         status: curActiveKey.trim() ? 'translating' : 'pending',
       }
@@ -288,7 +322,7 @@ export default function App() {
       if (curActiveKey.trim()) {
         processTranslation(
           newItemId,
-          sentence,
+          trimmedSentence,
           curEngine,
           sourceLang,
           sourceLangObj.name,
@@ -340,6 +374,53 @@ export default function App() {
     onError: handleSpeechError,
   })
 
+  // Audio Stream Phrase Transcription (Fallback for mobile mic exclusivity)
+  const handlePhraseRecorded = useCallback(
+    async (phraseBlob: Blob) => {
+      const currentGeminiKey =
+        geminiApiKey.trim() ||
+        (engine === 'gemini' ? activeApiKey.trim() : '')
+
+      if (!currentGeminiKey) return
+
+      setIsAudioTranscribing(true)
+      try {
+        const base64 = await blobToBase64(phraseBlob)
+        const text = await transcribeAudioWithGemini({
+          audioBase64: base64,
+          mimeType: 'audio/wav',
+          sourceLangName: sourceLangObj.name,
+          apiKey: currentGeminiKey,
+        })
+        if (text && text.trim()) {
+          handleFinalSentence(text.trim(), 'audio_stream')
+        }
+      } catch (err) {
+        console.warn('Audio stream STT error:', err)
+      } finally {
+        setIsAudioTranscribing(false)
+      }
+    },
+    [geminiApiKey, engine, activeApiKey, sourceLangObj.name, handleFinalSentence]
+  )
+
+  const handleSpeechDetected = useCallback((isSpeaking: boolean) => {
+    setIsAudioSpeaking(isSpeaking)
+  }, [])
+
+  const {
+    isRecording: isAudioRecording,
+    isPaused: isAudioPaused,
+    startRecording: startAudioRecording,
+    pauseRecording: pauseAudioRecording,
+    resumeRecording: resumeAudioRecording,
+    stopRecording: stopAudioRecording,
+    discardRecording: discardAudioRecording,
+  } = useAudioRecorder({
+    onPhraseRecorded: handlePhraseRecorded,
+    onSpeechDetected: handleSpeechDetected,
+  })
+
   // Start Button Handler with API Key validation & MP3 Recording
   const handleStart = async () => {
     if (!activeApiKey.trim()) {
@@ -352,26 +433,26 @@ export default function App() {
       return
     }
 
-    if (!isSupported) {
-      addToast(
-        '현재 브라우저에서는 Web Speech API를 지원하지 않습니다. Chrome 브라우저를 이용해주세요.',
-        'error'
-      )
-      return
+    // Call startListening SYNCHRONOUSLY within the user touch/click gesture!
+    // This is critical for mobile browsers where transient user activation expires across await.
+    if (isSupported) {
+      try {
+        startListening()
+      } catch (sttErr) {
+        console.warn('Sync startListening warning:', sttErr)
+      }
     }
 
     try {
       await startAudioRecording()
-      startListening()
       addToast(
         '실시간 음성 인식 및 MP3 음성 녹음을 시작했습니다. (128 kbps)',
         'info'
       )
     } catch (err: any) {
       console.warn('Audio recording failed to start:', err)
-      startListening()
       addToast(
-        '마이크 녹음 권한이 없거나 오류가 발생했습니다. STT 음성인식만 시작합니다.',
+        '마이크 녹음 권한이 없거나 오류가 발생했습니다. STT 음성인식만 시도합니다.',
         'warning'
       )
     }
@@ -676,6 +757,17 @@ export default function App() {
     }
   }
 
+  // Combined active states between Web Speech API and Audio Recorder VAD
+  const isActivelyListening = isListening || isAudioRecording
+  const isActivelyPaused = isPaused || isAudioPaused
+  const activeInterimText =
+    interimText ||
+    (isAudioSpeaking
+      ? '🎤 음성 감지 중... (말씀하시는 중)'
+      : isAudioTranscribing
+      ? '⏳ 음성 변환 중...'
+      : '')
+
   return (
     <div className="h-screen bg-slate-50 text-slate-800 flex flex-col antialiased overflow-hidden">
       {/* 1. Admin Login Gate */}
@@ -683,8 +775,8 @@ export default function App() {
 
       {/* 2. Top Navigation Bar */}
       <Navbar
-        isListening={isListening}
-        isPaused={isPaused}
+        isListening={isActivelyListening}
+        isPaused={isActivelyPaused}
         totalSentences={items.length}
         engine={engine}
         onLogout={handleLogout}
@@ -717,8 +809,8 @@ export default function App() {
             targetLang={targetLang}
             onTargetLangChange={setTargetLang}
             onSwapLanguages={handleSwapLanguages}
-            isListening={isListening}
-            isPaused={isPaused}
+            isListening={isActivelyListening}
+            isPaused={isActivelyPaused}
             onStart={handleStart}
             onPause={handlePause}
             onResume={handleResume}
@@ -737,12 +829,12 @@ export default function App() {
           {/* Subtitle Dual Panels */}
           <SubtitlePanel
             items={items}
-            interimText={interimText}
+            interimText={activeInterimText}
             sourceLang={sourceLangObj}
             targetLang={targetLangObj}
             fontSize={fontSize}
             autoScroll={autoScroll}
-            isListening={isListening}
+            isListening={isActivelyListening}
             engine={engine}
             onRetryTranslation={handleRetryTranslation}
           />

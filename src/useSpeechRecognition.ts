@@ -69,8 +69,16 @@ export function useSpeechRecognition({
       recognitionRef.current = null
     }
 
+    const isMobile =
+      typeof navigator !== 'undefined' &&
+      /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(
+        navigator.userAgent
+      )
+
     const recognition = new SpeechRecognitionConstructor()
-    recognition.continuous = true
+    // On mobile devices, continuous = true triggers aggressive aborts in Chrome Android.
+    // continuous = false with keep-alive loop on onend provides stable transcription.
+    recognition.continuous = !isMobile
     recognition.interimResults = true
     recognition.lang = currentLangRef.current
     recognition.maxAlternatives = 1
@@ -115,10 +123,7 @@ export function useSpeechRecognition({
       }
 
       if (event.error === 'audio-capture') {
-        shouldListenRef.current = false
-        setIsListening(false)
-        setIsPaused(false)
-        onErrorRef.current?.('마이크 오디오를 캡처할 수 없습니다. 마이크 연결 상태를 확인해주세요.')
+        console.warn('STT audio-capture detected (possible mic contention on mobile). Keeping listener active...')
         return
       }
 

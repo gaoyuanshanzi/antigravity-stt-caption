@@ -7,6 +7,11 @@ interface AudioRecordResult {
   filename: string
 }
 
+interface UseAudioRecorderProps {
+  onPhraseRecorded?: (phraseBlob: Blob) => void
+  onSpeechDetected?: (isSpeaking: boolean) => void
+}
+
 function floatToInt16(floatArray: Float32Array): Int16Array {
   const int16 = new Int16Array(floatArray.length)
   for (let i = 0; i < floatArray.length; i++) {
@@ -27,7 +32,76 @@ function getFormattedDateTime(): string {
   return `${year}${month}${day}_${hours}${minutes}${seconds}`
 }
 
-export function useAudioRecorder() {
+// Encode raw 16kHz mono Float32 audio samples into standard RIFF 16-bit PCM WAV
+function encodeWav(samples: Float32Array, sampleRate: number): Blob {
+  const buffer = new ArrayBuffer(44 + samples.length * 2)
+  const view = new DataView(buffer)
+
+  const writeString = (offset: number, str: string) => {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i))
+    }
+  }
+
+  // RIFF header
+  writeString(0, 'RIFF')
+  view.setUint32(4, 36 + samples.length * 2, true)
+  writeString(8, 'WAVE')
+
+  // fmt subchunk
+  writeString(12, 'fmt ')
+  view.setUint32(16, 16, true) // SubChunk1Size (16 for PCM)
+  view.setUint16(20, 1, true) // AudioFormat (1 = PCM)
+  view.setUint16(22, 1, true) // NumChannels (1 = Mono)
+  view.setUint32(24, sampleRate, true) // SampleRate
+  view.setUint32(28, sampleRate * 2, true) // ByteRate (SampleRate * NumChannels * BitsPerSample/8)
+  view.setUint16(32, 2, true) // BlockAlign (NumChannels * BitsPerSample/8)
+  view.setUint16(34, 16, true) // BitsPerSample (16-bit)
+
+  // data subchunk
+  writeString(36, 'data')
+  view.setUint32(40, samples.length * 2, true)
+
+  let offset = 44
+  for (let i = 0; i < samples.length; i++, offset += 2) {
+    const s = Math.max(-1, Math.min(1, samples[i]))
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true)
+  }
+
+  return new Blob([buffer], { type: 'audio/wav' })
+}
+
+// Downsample audio buffer to 16,000 Hz for optimal Gemini STT performance
+function downsampleBuffer(
+  buffer: Float32Array,
+  inputSampleRate: number,
+  outputSampleRate: number = 16000
+): Float32Array {
+  if (outputSampleRate >= inputSampleRate) return buffer
+  const ratio = inputSampleRate / outputSampleRate
+  const newLength = Math.round(buffer.length / ratio)
+  const result = new Float32Array(newLength)
+  let offsetResult = 0
+  let offsetBuffer = 0
+  while (offsetResult < result.length) {
+    const nextOffsetBuffer = Math.round((offsetResult + 1) * ratio)
+    let accum = 0
+    let count = 0
+    for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+      accum += buffer[i]
+      count++
+    }
+    result[offsetResult] = count > 0 ? accum / count : 0
+    offsetResult++
+    offsetBuffer = nextOffsetBuffer
+  }
+  return result
+}
+
+export function useAudioRecorder({
+  onPhraseRecorded,
+  onSpeechDetected,
+}: UseAudioRecorderProps = {}) {
   const [isRecording, setIsRecording] = useState(false)
   const [isPaused, setIsPaused] = useState(false)
   const [isEncoding, setIsEncoding] = useState(false)
@@ -35,9 +109,68 @@ export function useAudioRecorder() {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
   const mediaStreamRef = useRef<MediaStream | null>(null)
   const audioChunksRef = useRef<Blob[]>([])
+
+  const isRecordingRef = useRef<boolean>(false)
+  const isPausedRef = useRef<boolean>(false)
+
+  // Web Audio VAD and PCM streaming refs
+  const audioCtxRef = useRef<AudioContext | null>(null)
+  const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null)
+  const phrasePcmBuffersRef = useRef<Float32Array[]>([])
+  const preRollPcmBuffersRef = useRef<Float32Array[]>([])
+
+  const isSpeakingRef = useRef<boolean>(false)
+  const speechStartTimeRef = useRef<number>(0)
+  const lastSpeechTimeRef = useRef<number>(0)
+
   const startTimeRef = useRef<number>(0)
   const accumulatedDurationRef = useRef<number>(0)
   const lastResumeTimeRef = useRef<number>(0)
+
+  const onPhraseRecordedRef = useRef(onPhraseRecorded)
+  onPhraseRecordedRef.current = onPhraseRecorded
+  const onSpeechDetectedRef = useRef(onSpeechDetected)
+  onSpeechDetectedRef.current = onSpeechDetected
+
+  const cleanupVad = useCallback(() => {
+    if (scriptProcessorRef.current) {
+      try {
+        scriptProcessorRef.current.disconnect()
+      } catch {
+        // ignore
+      }
+      scriptProcessorRef.current = null
+    }
+    if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
+      audioCtxRef.current.close().catch(() => {})
+      audioCtxRef.current = null
+    }
+    phrasePcmBuffersRef.current = []
+    preRollPcmBuffersRef.current = []
+    isSpeakingRef.current = false
+    speechStartTimeRef.current = 0
+    lastSpeechTimeRef.current = 0
+  }, [])
+
+  const emitCurrentPhrase = useCallback(() => {
+    if (phrasePcmBuffersRef.current.length === 0) return
+    let totalLen = 0
+    for (const b of phrasePcmBuffersRef.current) {
+      totalLen += b.length
+    }
+    if (totalLen === 0) return
+
+    const merged = new Float32Array(totalLen)
+    let offset = 0
+    for (const b of phrasePcmBuffersRef.current) {
+      merged.set(b, offset)
+      offset += b.length
+    }
+    phrasePcmBuffersRef.current = []
+
+    const wavBlob = encodeWav(merged, 16000)
+    onPhraseRecordedRef.current?.(wavBlob)
+  }, [])
 
   // Start recording
   const startRecording = useCallback(async () => {
@@ -47,9 +180,15 @@ export function useAudioRecorder() {
         mediaStreamRef.current.getTracks().forEach((t) => t.stop())
         mediaStreamRef.current = null
       }
+      cleanupVad()
 
       audioChunksRef.current = []
+      phrasePcmBuffersRef.current = []
+      preRollPcmBuffersRef.current = []
       accumulatedDurationRef.current = 0
+      isSpeakingRef.current = false
+      speechStartTimeRef.current = 0
+      lastSpeechTimeRef.current = 0
 
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -62,7 +201,7 @@ export function useAudioRecorder() {
 
       mediaStreamRef.current = stream
 
-      // Pick supported mime type
+      // Pick supported mime type for MediaRecorder MP3 workflow
       const mimeTypes = [
         'audio/webm;codecs=opus',
         'audio/webm',
@@ -75,6 +214,93 @@ export function useAudioRecorder() {
           selectedMimeType = mime
           break
         }
+      }
+
+      // Initialize Web Audio PCM processor for VAD & Real-time phrase STT
+      try {
+        const AudioContextClass =
+          window.AudioContext || (window as any).webkitAudioContext
+        const audioCtx = new AudioContextClass()
+        audioCtxRef.current = audioCtx
+
+        const source = audioCtx.createMediaStreamSource(stream)
+        // 4096 sample buffer (~85ms chunks at 48kHz)
+        const scriptNode = audioCtx.createScriptProcessor(4096, 1, 1)
+        const silentGain = audioCtx.createGain()
+        silentGain.gain.value = 0
+
+        source.connect(scriptNode)
+        scriptNode.connect(silentGain)
+        silentGain.connect(audioCtx.destination)
+        scriptProcessorRef.current = scriptNode
+
+        scriptNode.onaudioprocess = (event) => {
+          if (!isRecordingRef.current || isPausedRef.current) return
+
+          const inputData = event.inputBuffer.getChannelData(0)
+          const downsampled = downsampleBuffer(
+            inputData,
+            audioCtx.sampleRate,
+            16000
+          )
+
+          // RMS Energy Calculation
+          let sumSquare = 0
+          for (let i = 0; i < downsampled.length; i++) {
+            sumSquare += downsampled[i] * downsampled[i]
+          }
+          const rms = Math.sqrt(sumSquare / downsampled.length)
+          const now = Date.now()
+          const isVoice = rms >= 0.012
+
+          if (isVoice) {
+            if (!isSpeakingRef.current) {
+              isSpeakingRef.current = true
+              speechStartTimeRef.current = now
+              onSpeechDetectedRef.current?.(true)
+
+              // Prepend pre-roll buffer to retain initial syllable
+              for (const prev of preRollPcmBuffersRef.current) {
+                phrasePcmBuffersRef.current.push(prev)
+              }
+              preRollPcmBuffersRef.current = []
+            }
+            lastSpeechTimeRef.current = now
+            phrasePcmBuffersRef.current.push(new Float32Array(downsampled))
+
+            // Long utterance guard (continuous speech > 6.5s)
+            if (now - speechStartTimeRef.current > 6500) {
+              emitCurrentPhrase()
+              speechStartTimeRef.current = now
+            }
+          } else {
+            // Silence
+            if (isSpeakingRef.current) {
+              phrasePcmBuffersRef.current.push(new Float32Array(downsampled))
+              // If silence pause has lasted for >= 750ms
+              if (now - lastSpeechTimeRef.current >= 750) {
+                const speechDuration =
+                  lastSpeechTimeRef.current - speechStartTimeRef.current
+                if (speechDuration >= 350) {
+                  emitCurrentPhrase()
+                } else {
+                  phrasePcmBuffersRef.current = []
+                }
+                isSpeakingRef.current = false
+                speechStartTimeRef.current = 0
+                onSpeechDetectedRef.current?.(false)
+              }
+            } else {
+              // Maintain rolling pre-roll buffer (~300ms)
+              preRollPcmBuffersRef.current.push(new Float32Array(downsampled))
+              if (preRollPcmBuffersRef.current.length > 3) {
+                preRollPcmBuffersRef.current.shift()
+              }
+            }
+          }
+        }
+      } catch (vadErr) {
+        console.warn('Web Audio VAD initialization skipped:', vadErr)
       }
 
       const recorder = selectedMimeType
@@ -91,16 +317,20 @@ export function useAudioRecorder() {
       mediaRecorderRef.current = recorder
       startTimeRef.current = Date.now()
       lastResumeTimeRef.current = Date.now()
+      isRecordingRef.current = true
+      isPausedRef.current = false
       setIsRecording(true)
       setIsPaused(false)
     } catch (err) {
       console.error('Failed to start audio recording:', err)
+      cleanupVad()
       throw err
     }
-  }, [])
+  }, [cleanupVad, emitCurrentPhrase])
 
   // Pause recording
   const pauseRecording = useCallback(() => {
+    isPausedRef.current = true
     if (
       mediaRecorderRef.current &&
       mediaRecorderRef.current.state === 'recording'
@@ -113,6 +343,10 @@ export function useAudioRecorder() {
 
   // Resume recording
   const resumeRecording = useCallback(() => {
+    isPausedRef.current = false
+    if (audioCtxRef.current && audioCtxRef.current.state === 'suspended') {
+      audioCtxRef.current.resume().catch(() => {})
+    }
     if (
       mediaRecorderRef.current &&
       mediaRecorderRef.current.state === 'paused'
@@ -125,6 +359,10 @@ export function useAudioRecorder() {
 
   // Stop recording and encode to MP3 (128 kbps stereo/mono)
   const stopRecording = useCallback(async (): Promise<AudioRecordResult | null> => {
+    isRecordingRef.current = false
+    isPausedRef.current = false
+    cleanupVad()
+
     return new Promise((resolve, reject) => {
       const recorder = mediaRecorderRef.current
       if (!recorder) {
@@ -240,9 +478,12 @@ export function useAudioRecorder() {
         reject(err)
       }
     })
-  }, [])
+  }, [cleanupVad])
 
   const discardRecording = useCallback(() => {
+    isRecordingRef.current = false
+    isPausedRef.current = false
+    cleanupVad()
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
       try {
         mediaRecorderRef.current.stop()
@@ -258,7 +499,7 @@ export function useAudioRecorder() {
     setIsRecording(false)
     setIsPaused(false)
     setIsEncoding(false)
-  }, [])
+  }, [cleanupVad])
 
   return {
     isRecording,
