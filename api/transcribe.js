@@ -27,7 +27,7 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { audioBase64, mimeType = 'audio/webm', sourceLangName = '브라질 포르투갈어 (language code: pt-BR)', apiKey } = req.body || {}
+    const { audioBase64, mimeType = 'audio/webm', sourceLangName = '한국어', apiKey } = req.body || {}
 
     if (!apiKey || !apiKey.trim()) {
       return res.status(400).json({ error: 'Gemini API Key를 입력해주세요.' })
@@ -73,13 +73,16 @@ export default async function handler(req, res) {
       },
     }
 
+    // Google Generative Language API models - gemini-3.6-flash is recommended by Google
     const candidateModels = [
+      'gemini-3.6-flash',
       'gemini-2.0-flash',
+      'gemini-2.0-flash-lite',
       'gemini-1.5-flash',
-      'gemini-2.5-flash',
+      'gemini-1.5-flash-8b',
     ]
 
-    let lastError = null
+    const errors = []
 
     for (const model of candidateModels) {
       try {
@@ -98,27 +101,30 @@ export default async function handler(req, res) {
 
         if (!response.ok) {
           const errMsg = data?.error?.message || `HTTP ${response.status} ${response.statusText}`
-          console.error(`Gemini STT model ${model} failed:`, errMsg)
-          lastError = errMsg
+          console.warn(`[STT] model ${model} failed: ${errMsg}`)
+          errors.push(`${model}: ${errMsg}`)
           continue
         }
 
         const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || ''
         const cleanedText = rawText.replace(/^["'“”‘’]|["'“”‘’]$/g, '').trim()
 
+        console.log(`[STT] Success with ${model}: "${cleanedText.slice(0, 50)}"`)
+
         return res.status(200).json({
           text: cleanedText,
           model,
         })
       } catch (err) {
-        console.error(`Gemini STT fetch exception for ${model}:`, err)
-        lastError = err.message
+        console.warn(`[STT] exception with ${model}:`, err)
+        errors.push(`${model}: ${err.message}`)
         continue
       }
     }
 
     return res.status(500).json({
-      error: `Gemini 음성인식 실패: ${lastError || '모든 모델 응답 없음'}`,
+      error: `Gemini 음성인식 실패: ${errors[0] || '모든 모델 응답 없음'}`,
+      allErrors: errors,
     })
   } catch (error) {
     console.error('Transcribe handler error:', error)
