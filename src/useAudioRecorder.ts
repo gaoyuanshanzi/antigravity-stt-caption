@@ -32,6 +32,48 @@ function getFormattedDateTime(): string {
   return `${year}${month}${day}_${hours}${minutes}${seconds}`
 }
 
+// Generates a 100% valid standard 16-bit Mono PCM RIFF WAV Blob
+function encodeWav(samples: Float32Array, sampleRate: number): Blob {
+  const buffer = new ArrayBuffer(44 + samples.length * 2)
+  const view = new DataView(buffer)
+
+  const writeString = (offset: number, str: string) => {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i))
+    }
+  }
+
+  // RIFF Chunk Descriptor
+  writeString(0, 'RIFF')
+  view.setUint32(4, 36 + samples.length * 2, true)
+  writeString(8, 'WAVE')
+
+  // fmt sub-chunk
+  writeString(12, 'fmt ')
+  view.setUint32(16, 16, true) // Subchunk1Size (16 for PCM)
+  view.setUint16(20, 1, true) // AudioFormat (1 for PCM)
+  view.setUint16(22, 1, true) // NumChannels (1 = Mono)
+  view.setUint32(24, sampleRate, true) // SampleRate
+  view.setUint32(28, sampleRate * 2, true) // ByteRate (SampleRate * 1 * 2)
+  view.setUint16(32, 2, true) // BlockAlign (NumChannels * BitsPerSample/8)
+  view.setUint16(34, 16, true) // BitsPerSample (16-bit)
+
+  // data sub-chunk
+  writeString(36, 'data')
+  view.setUint32(40, samples.length * 2, true)
+
+  // Write 16-bit linear PCM samples
+  let offset = 44
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]))
+    const val = s < 0 ? s * 0x8000 : s * 0x7fff
+    view.setInt16(offset, val, true)
+    offset += 2
+  }
+
+  return new Blob([buffer], { type: 'audio/wav' })
+}
+
 export function useAudioRecorder({
   onPhraseRecorded,
   onSpeechDetected,
@@ -40,24 +82,23 @@ export function useAudioRecorder({
   const [isPaused, setIsPaused] = useState(false)
   const [isEncoding, setIsEncoding] = useState(false)
 
-  // Full recording refs
+  // Full recording refs (for MP3 file saving)
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
   const mediaStreamRef = useRef<MediaStream | null>(null)
   const audioChunksRef = useRef<Blob[]>([])
-  const selectedMimeTypeRef = useRef<string>('')
 
-  // Phrase STT refs (header chunk + speech window chunks)
-  const headerChunkRef = useRef<Blob | null>(null)
-  const phraseChunksRef = useRef<Blob[]>([])
-  const chunkIndexRef = useRef<number>(0)
+  // Web Audio VAD + PCM streaming refs
+  const audioCtxRef = useRef<AudioContext | null>(null)
+  const scriptNodeRef = useRef<ScriptProcessorNode | null>(null)
+  const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null)
+  const muteGainRef = useRef<GainNode | null>(null)
 
-  // VAD state refs
-  const vadIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
-  const analyserRef = useRef<AnalyserNode | null>(null)
-  const vadAudioCtxRef = useRef<AudioContext | null>(null)
+  // VAD & Phrase accumulation state
   const isSpeakingRef = useRef<boolean>(false)
   const speechStartTimeRef = useRef<number>(0)
   const lastSpeechTimeRef = useRef<number>(0)
+  const phrasePcmChunksRef = useRef<Float32Array[]>([])
+  const preRollRingBufferRef = useRef<Float32Array[]>([]) // Keeps last ~0.75s to avoid clipping first syllable
   const isRecordingRef = useRef<boolean>(false)
   const isPausedRef = useRef<boolean>(false)
 
@@ -71,55 +112,66 @@ export function useAudioRecorder({
   const onSpeechDetectedRef = useRef(onSpeechDetected)
   onSpeechDetectedRef.current = onSpeechDetected
 
-  const cleanupVad = useCallback(() => {
-    if (vadIntervalRef.current) {
-      clearInterval(vadIntervalRef.current)
-      vadIntervalRef.current = null
+  const cleanupWebAudio = useCallback(() => {
+    if (scriptNodeRef.current) {
+      try { scriptNodeRef.current.disconnect() } catch { /* ignore */ }
+      scriptNodeRef.current.onaudioprocess = null
+      scriptNodeRef.current = null
     }
-    if (analyserRef.current) {
-      try { analyserRef.current.disconnect() } catch { /* ignore */ }
-      analyserRef.current = null
+    if (sourceNodeRef.current) {
+      try { sourceNodeRef.current.disconnect() } catch { /* ignore */ }
+      sourceNodeRef.current = null
     }
-    if (vadAudioCtxRef.current && vadAudioCtxRef.current.state !== 'closed') {
-      vadAudioCtxRef.current.close().catch(() => {})
-      vadAudioCtxRef.current = null
+    if (muteGainRef.current) {
+      try { muteGainRef.current.disconnect() } catch { /* ignore */ }
+      muteGainRef.current = null
     }
-    phraseChunksRef.current = []
-    headerChunkRef.current = null
+    if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
+      audioCtxRef.current.close().catch(() => {})
+      audioCtxRef.current = null
+    }
+    phrasePcmChunksRef.current = []
+    preRollRingBufferRef.current = []
     isSpeakingRef.current = false
     speechStartTimeRef.current = 0
     lastSpeechTimeRef.current = 0
   }, [])
 
-  const emitPhrase = useCallback(() => {
-    const header = headerChunkRef.current
-    const chunks = phraseChunksRef.current
-    phraseChunksRef.current = []
+  const emitCurrentPhrase = useCallback(() => {
+    const chunks = phrasePcmChunksRef.current
+    phrasePcmChunksRef.current = []
 
-    if (!header || chunks.length === 0) return
+    if (chunks.length === 0) return
 
-    const mimeType = selectedMimeTypeRef.current || 'audio/webm'
-    // Always prepend the WebM header chunk to ensure decodability
-    const blob = new Blob([header, ...chunks], { type: mimeType })
+    let totalLength = 0
+    for (const c of chunks) totalLength += c.length
+    if (totalLength < 16000 * 0.35) return // Ignore under 350ms of audio
 
-    if (blob.size < 1000) return // Skip suspiciously small blobs (< 1KB)
+    const merged = new Float32Array(totalLength)
+    let offset = 0
+    for (const c of chunks) {
+      merged.set(c, offset)
+      offset += c.length
+    }
 
-    onPhraseRecordedRef.current?.(blob, mimeType)
+    // Always 16kHz mono WAV for Google Gemini API
+    const sampleRate = audioCtxRef.current?.sampleRate || 16000
+    const wavBlob = encodeWav(merged, sampleRate)
+
+    onPhraseRecordedRef.current?.(wavBlob, 'audio/wav')
   }, [])
 
   const startRecording = useCallback(async () => {
     try {
-      // Cleanup previous session
       if (mediaStreamRef.current) {
         mediaStreamRef.current.getTracks().forEach((t) => t.stop())
         mediaStreamRef.current = null
       }
-      cleanupVad()
+      cleanupWebAudio()
 
       audioChunksRef.current = []
-      phraseChunksRef.current = []
-      headerChunkRef.current = null
-      chunkIndexRef.current = 0
+      phrasePcmChunksRef.current = []
+      preRollRingBufferRef.current = []
       accumulatedDurationRef.current = 0
       isSpeakingRef.current = false
 
@@ -134,7 +186,107 @@ export function useAudioRecorder({
 
       mediaStreamRef.current = stream
 
-      // Select supported MIME type
+      // ── 1. Setup Web Audio API with 16kHz PCM VAD ──
+      try {
+        const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext
+        // Aim for 16kHz context directly, or fallback to default sampleRate
+        let ctx: AudioContext
+        try {
+          ctx = new AudioContextClass({ sampleRate: 16000 })
+        } catch {
+          ctx = new AudioContextClass()
+        }
+
+        if (ctx.state === 'suspended') {
+          await ctx.resume()
+        }
+
+        audioCtxRef.current = ctx
+        const source = ctx.createMediaStreamSource(stream)
+        sourceNodeRef.current = source
+
+        // Buffer size 4096 gives ~256ms per slice at 16kHz, ~92ms at 44.1kHz
+        const processor = ctx.createScriptProcessor(4096, 1, 1)
+        scriptNodeRef.current = processor
+
+        // Mute gain node connected to destination prevents garbage collection
+        const muteGain = ctx.createGain()
+        muteGain.gain.value = 0
+        muteGainRef.current = muteGain
+
+        source.connect(processor)
+        processor.connect(muteGain)
+        muteGain.connect(ctx.destination)
+
+        processor.onaudioprocess = (e) => {
+          if (!isRecordingRef.current || isPausedRef.current) return
+
+          const inputData = e.inputBuffer.getChannelData(0)
+          const pcmChunk = new Float32Array(inputData)
+
+          // Calculate RMS (energy)
+          let sumSquares = 0
+          let peak = 0
+          for (let i = 0; i < pcmChunk.length; i++) {
+            const val = Math.abs(pcmChunk[i])
+            if (val > peak) peak = val
+            sumSquares += pcmChunk[i] * pcmChunk[i]
+          }
+          const rms = Math.sqrt(sumSquares / pcmChunk.length)
+
+          // Voice detection criteria: RMS >= 0.010 OR peak >= 0.045
+          const isVoice = rms >= 0.010 || peak >= 0.045
+          const now = Date.now()
+
+          // Maintain pre-roll buffer (last 3 chunks, ~0.75s)
+          const preRoll = preRollRingBufferRef.current
+          preRoll.push(pcmChunk)
+          if (preRoll.length > 3) preRoll.shift()
+
+          if (isVoice) {
+            if (!isSpeakingRef.current) {
+              isSpeakingRef.current = true
+              speechStartTimeRef.current = now
+              onSpeechDetectedRef.current?.(true)
+
+              // Prepend pre-roll buffers to preserve the starting consonant/syllable
+              for (const pr of preRoll) {
+                phrasePcmChunksRef.current.push(pr)
+              }
+            }
+            lastSpeechTimeRef.current = now
+            phrasePcmChunksRef.current.push(pcmChunk)
+
+            // Split long continuous speech at 6.5s
+            if (now - speechStartTimeRef.current > 6500) {
+              emitCurrentPhrase()
+              speechStartTimeRef.current = now
+            }
+          } else {
+            if (isSpeakingRef.current) {
+              // Still in speech pause window: collect chunk
+              phrasePcmChunksRef.current.push(pcmChunk)
+
+              // Silence threshold: 750ms of silence marks phrase end
+              if (now - lastSpeechTimeRef.current >= 750) {
+                const speechDuration = lastSpeechTimeRef.current - speechStartTimeRef.current
+                if (speechDuration >= 350) {
+                  emitCurrentPhrase()
+                } else {
+                  phrasePcmChunksRef.current = []
+                }
+                isSpeakingRef.current = false
+                speechStartTimeRef.current = 0
+                onSpeechDetectedRef.current?.(false)
+              }
+            }
+          }
+        }
+      } catch (audioErr) {
+        console.warn('Web Audio VAD initialization warning:', audioErr)
+      }
+
+      // ── 2. Setup MediaRecorder for Full MP3 Saving ──
       const mimeTypes = [
         'audio/webm;codecs=opus',
         'audio/webm',
@@ -149,113 +301,18 @@ export function useAudioRecorder({
           break
         }
       }
-      selectedMimeTypeRef.current = selectedMimeType
 
-      // ── VAD using AnalyserNode + setInterval (works reliably on all mobile browsers) ──
-      try {
-        const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext
-        const vadCtx = new AudioContextClass({ sampleRate: 16000 })
-
-        // Mobile browsers start AudioContext in suspended state
-        if (vadCtx.state === 'suspended') {
-          await vadCtx.resume()
-        }
-
-        vadAudioCtxRef.current = vadCtx
-        const source = vadCtx.createMediaStreamSource(stream)
-        const analyser = vadCtx.createAnalyser()
-        analyser.fftSize = 512
-        analyser.smoothingTimeConstant = 0.5
-        source.connect(analyser)
-        analyserRef.current = analyser
-
-        const freqBuffer = new Uint8Array(analyser.frequencyBinCount)
-
-        vadIntervalRef.current = setInterval(() => {
-          if (!isRecordingRef.current || isPausedRef.current) return
-
-          analyser.getByteFrequencyData(freqBuffer)
-
-          // Focus on speech frequency range (300-3400 Hz for voice)
-          const sampleRate = vadCtx.sampleRate || 16000
-          const binHz = sampleRate / (analyser.fftSize)
-          const lowBin = Math.floor(300 / binHz)
-          const highBin = Math.ceil(3400 / binHz)
-
-          let sum = 0
-          let count = 0
-          for (let i = lowBin; i < highBin && i < freqBuffer.length; i++) {
-            sum += freqBuffer[i]
-            count++
-          }
-          const avg = count > 0 ? sum / count : 0
-
-          const now = Date.now()
-          const isVoice = avg >= 10
-
-          if (isVoice) {
-            if (!isSpeakingRef.current) {
-              isSpeakingRef.current = true
-              speechStartTimeRef.current = now
-              onSpeechDetectedRef.current?.(true)
-            }
-            lastSpeechTimeRef.current = now
-
-            // Long utterance guard: slice at 7s
-            if (now - speechStartTimeRef.current > 7000) {
-              emitPhrase()
-              speechStartTimeRef.current = now
-            }
-          } else {
-            if (isSpeakingRef.current) {
-              // Require 800ms of silence before emitting phrase
-              if (now - lastSpeechTimeRef.current >= 800) {
-                const speechDuration = lastSpeechTimeRef.current - speechStartTimeRef.current
-                if (speechDuration >= 400) {
-                  emitPhrase()
-                } else {
-                  // Too short, discard
-                  phraseChunksRef.current = []
-                }
-                isSpeakingRef.current = false
-                speechStartTimeRef.current = 0
-                onSpeechDetectedRef.current?.(false)
-              }
-            }
-          }
-        }, 80)
-      } catch (vadErr) {
-        console.warn('VAD AnalyserNode initialization failed (non-fatal):', vadErr)
-      }
-
-      // ── MediaRecorder for full MP3 + phrase chunk collection ──
       const recorder = selectedMimeType
         ? new MediaRecorder(stream, { mimeType: selectedMimeType })
         : new MediaRecorder(stream)
 
       recorder.ondataavailable = (event) => {
-        if (!event.data || event.data.size === 0) return
-
-        const chunkIdx = chunkIndexRef.current++
-        audioChunksRef.current.push(event.data)
-
-        // Store the first chunk as the WebM/codec header
-        if (chunkIdx === 0) {
-          headerChunkRef.current = event.data
-          return // Don't add header to phrase chunks yet
-        }
-
-        // Only collect phrase chunks while speaking or within 400ms after speech ends
-        const now = Date.now()
-        if (
-          isSpeakingRef.current ||
-          (lastSpeechTimeRef.current > 0 && now - lastSpeechTimeRef.current < 400)
-        ) {
-          phraseChunksRef.current.push(event.data)
+        if (event.data && event.data.size > 0) {
+          audioChunksRef.current.push(event.data)
         }
       }
 
-      recorder.start(200) // 200ms timeslice for responsive VAD chunk collection
+      recorder.start(1000)
       mediaRecorderRef.current = recorder
       startTimeRef.current = Date.now()
       lastResumeTimeRef.current = Date.now()
@@ -265,15 +322,15 @@ export function useAudioRecorder({
       setIsPaused(false)
     } catch (err) {
       console.error('Failed to start audio recording:', err)
-      cleanupVad()
+      cleanupWebAudio()
       throw err
     }
-  }, [cleanupVad, emitPhrase])
+  }, [cleanupWebAudio, emitCurrentPhrase])
 
   const pauseRecording = useCallback(() => {
     isPausedRef.current = true
-    if (vadAudioCtxRef.current && vadAudioCtxRef.current.state === 'running') {
-      vadAudioCtxRef.current.suspend().catch(() => {})
+    if (audioCtxRef.current && audioCtxRef.current.state === 'running') {
+      audioCtxRef.current.suspend().catch(() => {})
     }
     if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
       mediaRecorderRef.current.pause()
@@ -284,8 +341,8 @@ export function useAudioRecorder({
 
   const resumeRecording = useCallback(() => {
     isPausedRef.current = false
-    if (vadAudioCtxRef.current && vadAudioCtxRef.current.state === 'suspended') {
-      vadAudioCtxRef.current.resume().catch(() => {})
+    if (audioCtxRef.current && audioCtxRef.current.state === 'suspended') {
+      audioCtxRef.current.resume().catch(() => {})
     }
     if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'paused') {
       mediaRecorderRef.current.resume()
@@ -297,7 +354,12 @@ export function useAudioRecorder({
   const stopRecording = useCallback(async (): Promise<AudioRecordResult | null> => {
     isRecordingRef.current = false
     isPausedRef.current = false
-    cleanupVad()
+
+    // Flush any pending phrase before stopping
+    if (isSpeakingRef.current && phrasePcmChunksRef.current.length > 0) {
+      emitCurrentPhrase()
+    }
+    cleanupWebAudio()
 
     return new Promise((resolve, reject) => {
       const recorder = mediaRecorderRef.current
@@ -399,12 +461,12 @@ export function useAudioRecorder({
         reject(err)
       }
     })
-  }, [cleanupVad])
+  }, [cleanupWebAudio, emitCurrentPhrase])
 
   const discardRecording = useCallback(() => {
     isRecordingRef.current = false
     isPausedRef.current = false
-    cleanupVad()
+    cleanupWebAudio()
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
       try { mediaRecorderRef.current.stop() } catch { /* ignore */ }
     }
@@ -416,7 +478,7 @@ export function useAudioRecorder({
     setIsRecording(false)
     setIsPaused(false)
     setIsEncoding(false)
-  }, [cleanupVad])
+  }, [cleanupWebAudio])
 
   return {
     isRecording,

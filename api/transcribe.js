@@ -56,13 +56,13 @@ export default async function handler(req, res) {
           role: 'user',
           parts: [
             {
-              text: promptText,
-            },
-            {
               inlineData: {
                 mimeType: cleanMimeType,
                 data: base64Data,
               },
+            },
+            {
+              text: promptText,
             },
           ],
         },
