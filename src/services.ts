@@ -238,14 +238,47 @@ export async function transcribeAudioWithGemini({
 }: AudioTranscriptionParams): Promise<string> {
   const trimmedKey = apiKey.trim()
   if (!trimmedKey) {
-    return ''
+    throw new Error('Gemini API Key를 입력해주세요.')
   }
 
+  // 1. Prefer Vercel serverless proxy (/api/transcribe) to avoid mobile CORS and browser body limitations
+  try {
+    const proxyResponse = await fetch('/api/transcribe', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        audioBase64,
+        mimeType,
+        sourceLangName,
+        apiKey: trimmedKey,
+      }),
+    })
+
+    const proxyData = await proxyResponse.json().catch(() => ({}))
+
+    if (proxyResponse.ok) {
+      return (proxyData.text || '').trim()
+    } else if (proxyResponse.status !== 404) {
+      throw new Error(proxyData.error || `서버 변환 오류 (${proxyResponse.status})`)
+    }
+  } catch (proxyErr: any) {
+    // If it's a known API error, bubble it up
+    if (proxyErr?.message && !proxyErr.message.includes('404') && !proxyErr.message.includes('Failed to fetch')) {
+      throw proxyErr
+    }
+    console.warn('/api/transcribe unavailable or failed, falling back to direct browser fetch:', proxyErr)
+  }
+
+  // 2. Direct browser fallback
   const base64Data = audioBase64.includes(',')
     ? audioBase64.split(',')[1]
     : audioBase64
 
   const cleanMimeType = mimeType.split(';')[0].trim() || 'audio/wav'
+
+  const promptText = `Transcribe all spoken words in the audio verbatim. The primary expected language is ${sourceLangName}, but accurately transcribe whatever language is spoken. Output ONLY the transcribed speech verbatim. Do NOT wrap in quotes. Do NOT add notes, explanations, or labels.`
 
   const requestBody = {
     contents: [
@@ -253,7 +286,7 @@ export async function transcribeAudioWithGemini({
         role: 'user',
         parts: [
           {
-            text: `Please transcribe the spoken speech in the audio verbatim into ${sourceLangName}. Output ONLY the transcribed words in ${sourceLangName}. Do NOT include explanations, introductory notes, markdown, or quotation marks. If no clear words are spoken, output nothing.`,
+            text: promptText,
           },
           {
             inlineData: {
@@ -274,8 +307,9 @@ export async function transcribeAudioWithGemini({
     'gemini-2.0-flash',
     'gemini-1.5-flash',
     'gemini-2.5-flash',
-    'gemini-1.5-flash-latest',
   ]
+
+  let lastError: string | null = null
 
   for (const model of candidateModels) {
     try {
@@ -290,24 +324,29 @@ export async function transcribeAudioWithGemini({
         }
       )
 
+      const data = await response.json().catch(() => ({}))
+
       if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}))
-        console.warn(`[Gemini STT] Model ${model} HTTP ${response.status}:`, errorData)
+        const errorMsg = data?.error?.message || `HTTP ${response.status} ${response.statusText}`
+        lastError = errorMsg
+        console.warn(`[Gemini STT Direct] Model ${model} HTTP ${response.status}:`, data)
         continue
       }
 
-      const data = await response.json()
       const text =
         data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || ''
 
       const cleaned = text.replace(/^["'“”‘’]|["'“”‘’]$/g, '').trim()
-      if (cleaned) {
-        return cleaned
-      }
-    } catch (err) {
-      console.warn(`[Gemini STT] Fetch failed for ${model}:`, err)
+      return cleaned
+    } catch (err: any) {
+      lastError = err?.message || String(err)
+      console.warn(`[Gemini STT Direct] Fetch failed for ${model}:`, err)
       continue
     }
+  }
+
+  if (lastError) {
+    throw new Error(`Gemini 변환 실패: ${lastError}`)
   }
 
   return ''

@@ -221,6 +221,9 @@ export function useAudioRecorder({
         const AudioContextClass =
           window.AudioContext || (window as any).webkitAudioContext
         const audioCtx = new AudioContextClass()
+        if (audioCtx.state === 'suspended') {
+          await audioCtx.resume()
+        }
         audioCtxRef.current = audioCtx
 
         const source = audioCtx.createMediaStreamSource(stream)
@@ -244,14 +247,18 @@ export function useAudioRecorder({
             16000
           )
 
-          // RMS Energy Calculation
+          // RMS Energy and Peak Amplitude Calculation
           let sumSquare = 0
+          let maxVal = 0
           for (let i = 0; i < downsampled.length; i++) {
-            sumSquare += downsampled[i] * downsampled[i]
+            const val = downsampled[i]
+            sumSquare += val * val
+            const abs = Math.abs(val)
+            if (abs > maxVal) maxVal = abs
           }
           const rms = Math.sqrt(sumSquare / downsampled.length)
           const now = Date.now()
-          const isVoice = rms >= 0.009
+          const isVoice = rms >= 0.007 || maxVal >= 0.035
 
           if (isVoice) {
             if (!isSpeakingRef.current) {
