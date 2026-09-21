@@ -1,3 +1,12 @@
+// Increase Vercel payload limit for audio base64 data
+export const config = {
+  api: {
+    bodyParser: {
+      sizeLimit: '10mb',
+    },
+  },
+}
+
 export default async function handler(req, res) {
   // CORS Headers
   res.setHeader('Access-Control-Allow-Credentials', 'true')
@@ -18,7 +27,7 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { audioBase64, mimeType = 'audio/wav', sourceLangName = '한국어', apiKey } = req.body || {}
+    const { audioBase64, mimeType = 'audio/webm', sourceLangName = '브라질 포르투갈어 (language code: pt-BR)', apiKey } = req.body || {}
 
     if (!apiKey || !apiKey.trim()) {
       return res.status(400).json({ error: 'Gemini API Key를 입력해주세요.' })
@@ -33,9 +42,13 @@ export default async function handler(req, res) {
       ? audioBase64.split(',')[1]
       : audioBase64
 
-    const cleanMimeType = mimeType.split(';')[0].trim() || 'audio/wav'
+    // Normalize MIME type – Gemini supports: audio/webm, audio/mp4, audio/wav, audio/ogg, audio/mpeg
+    const rawMime = mimeType.split(';')[0].trim()
+    const cleanMimeType = rawMime || 'audio/webm'
 
-    const promptText = `Transcribe all spoken words in the audio verbatim. The primary expected language is ${sourceLangName}, but accurately transcribe whatever language is spoken. Output ONLY the transcribed speech verbatim. Do NOT wrap in quotes. Do NOT add notes, explanations, or labels.`
+    console.log(`[STT] mimeType=${cleanMimeType} base64Len=${base64Data.length} lang=${sourceLangName}`)
+
+    const promptText = `Transcribe all spoken words in the audio verbatim. The primary expected language is ${sourceLangName}, but accurately transcribe whatever language is spoken. Output ONLY the transcribed speech verbatim. Do NOT wrap in quotes. Do NOT add notes, explanations, or labels. If there is silence or no clear speech, output an empty string.`
 
     const requestBody = {
       contents: [

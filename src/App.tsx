@@ -376,39 +376,47 @@ export default function App() {
 
   // Audio Stream Phrase Transcription (Fallback for mobile mic exclusivity)
   const handlePhraseRecorded = useCallback(
-    async (phraseBlob: Blob) => {
+    async (phraseBlob: Blob, blobMimeType?: string) => {
       const currentGeminiKey =
         geminiApiKey.trim() ||
         (engine === 'gemini' ? activeApiKey.trim() : '')
 
       if (!currentGeminiKey) {
         addToast(
-          'Gemini API Key가 등록되지 않아 모바일 음성 변환을 완료할 수 없습니다. 상단에 Gemini API Key를 입력해주세요.',
+          'Gemini API Key가 없어 모바일 음성 변환 불가. 상단 입력창에 Gemini API Key를 입력해주세요.',
           'warning'
         )
         return
       }
 
+      if (phraseBlob.size < 1000) return // Skip empty blobs
+
       setIsAudioTranscribing(true)
       try {
         const base64 = await blobToBase64(phraseBlob)
-        const langDescriptor = `${sourceLangObj.name} (${sourceLangObj.nativeName || sourceLangObj.code})`
+        const actualMime = blobMimeType || phraseBlob.type || 'audio/webm'
+        // Use language code for clearer Gemini STT prompt
+        const langCode = sourceLang // e.g. 'pt-BR', 'ko-KR'
+        const langNative = sourceLangObj.nativeName || sourceLangObj.name
+        const langDescriptor = `${langNative} (language code: ${langCode})`
         const text = await transcribeAudioWithGemini({
           audioBase64: base64,
-          mimeType: 'audio/wav',
+          mimeType: actualMime,
           sourceLangName: langDescriptor,
           apiKey: currentGeminiKey,
         })
         if (text && text.trim()) {
           handleFinalSentence(text.trim(), 'audio_stream')
         }
-      } catch (err) {
-        console.warn('Audio stream STT error:', err)
+      } catch (err: any) {
+        const errMsg = err?.message || String(err)
+        console.warn('Audio stream STT error:', errMsg)
+        addToast(`음성 변환 오류: ${errMsg}`, 'error')
       } finally {
         setIsAudioTranscribing(false)
       }
     },
-    [geminiApiKey, engine, activeApiKey, sourceLangObj, handleFinalSentence, addToast]
+    [geminiApiKey, engine, activeApiKey, sourceLang, sourceLangObj, handleFinalSentence, addToast]
   )
 
   const handleSpeechDetected = useCallback((isSpeaking: boolean) => {
